@@ -161,30 +161,6 @@ python main.py
 
 ---
 
-## 发布到 GitHub
-
-### 发布前必查（安全）
-
-- **不要提交**：`.env`（API Key）、`*.db`（用户数据）、`uploads/`（用户图片）。已写在 `.gitignore` 中，提交前请执行 `git status` 确认未被加入。
-- **可提交**：`.env.example`（示例配置，无真实密钥）。
-
-### 操作步骤
-
-1. 在 [github.com/new](https://github.com/new) 新建仓库（Public，不勾选 Add README）。
-2. 在项目目录执行：
-   ```bash
-   git init
-   git add .
-   git status    # 再次确认无 .env、*.db、uploads/
-   git commit -m "Initial commit: 树洞日记 情感陪伴 AI"
-   git branch -M main
-   git remote add origin https://github.com/你的用户名/仓库名.git
-   git push -u origin main
-   ```
-3. 他人克隆后：`cp .env.example .env` 并填写 Key → `pip install -r requirements.txt` → `python main.py`。
-
----
-
 ## 许可证
 
 MIT（或按需修改）。
