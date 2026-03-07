@@ -1,0 +1,34 @@
+# 环境与密钥（切勿提交真实 Key）
+.env
+.env.local
+.env.*.local
+
+# 数据库（含用户数据，本地运行生成）
+*.db
+companion.db
+
+# 用户上传的对话图片
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+.cache/
