@@ -1,0 +1,5 @@
+{
+  "buildCommand": "node scripts/write-config.js",
+  "outputDirectory": "static",
+  "framework": null
+}

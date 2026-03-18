@@ -696,8 +696,9 @@
     </div>
   </div>
 
+  <script src="/config.js"></script>
   <script>
-    const API_BASE = (typeof window !== 'undefined' && window.location.protocol === 'file:') ? 'http://127.0.0.1:8000' : '';
+    const API_BASE = (typeof window.__API_BASE__ === 'string') ? window.__API_BASE__ : ((typeof window !== 'undefined' && window.location.protocol === 'file:') ? 'http://127.0.0.1:8000' : '');
     const userId = 1;
     let sessionId = null;
     let isLoading = false;

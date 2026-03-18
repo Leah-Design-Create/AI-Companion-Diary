@@ -76,12 +76,23 @@ python main.py
 
 在浏览器打开 **http://127.0.0.1:8000** 或 **http://localhost:8000** 即可使用。（请通过该地址访问，不要直接打开 `static/index.html`，否则接口会失败。）
 
+**部署到云端**：支持部署到 **Render**（全栈）与 **Vercel**（仅前端），详见 [DEPLOY.md](DEPLOY.md)。
+
+### 浏览器访问不了时
+
+1. **确认服务已启动**：运行 `python main.py` 后，终端应显示启动成功和访问地址，且无报错退出。
+2. **用对地址**：在浏览器地址栏输入 `http://127.0.0.1:8000` 或 `http://localhost:8000`（不要用 `https`，不要漏掉端口 `:8000`）。
+3. **端口被占用**：若 8000 端口被占用，可修改 `main.py` 末尾的 `port = 8000` 为其他端口（如 8080），再访问对应地址。
+
 ---
 
 ## 项目结构
 
 ```
 ├── main.py              # FastAPI 入口与路由（聊天、会话、日记、知识库、上传等）
+├── render.yaml          # Render 部署配置
+├── vercel.json          # Vercel 部署配置（仅前端）
+├── DEPLOY.md            # 部署说明（Vercel + Render）
 ├── config.py            # 配置（API、数据库、久未登录天数、可选 TTS）
 ├── db.py                # SQLite 初始化：用户、会话、消息、知识库、上传图片等
 ├── prompts.py           # 人设、焦虑分析、总结、意图识别、心情分析等提示词
@@ -96,7 +107,10 @@ python main.py
 │   ├── reminder.py      # 久未登录问候
 │   └── tts.py           # 可选 DashScope TTS
 ├── static/
-│   └── index.html       # 前端：树洞日记 UI（说话 / 日记、侧栏、日历、详情弹窗等）
+│   ├── index.html       # 前端：树洞日记 UI（说话 / 日记、侧栏、日历、详情弹窗等）
+│   └── config.js        # 前端 API 地址（同源留空；Vercel 部署时由构建写入）
+├── scripts/
+│   └── write-config.js  # Vercel 构建时注入 API_URL 到 static/config.js
 ├── .env.example         # 环境变量示例（勿提交 .env）
 └── requirements.txt
 ```

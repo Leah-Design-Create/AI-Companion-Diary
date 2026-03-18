@@ -160,6 +160,23 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+@app.get("/config.js")
+async def serve_config_js():
+    """提供前端 API 地址配置（同源部署时为空；Vercel 部署时可指向 Render 后端）。"""
+    config_file = STATIC_DIR / "config.js"
+    if config_file.exists():
+        return Response(
+            content=config_file.read_text(encoding="utf-8"),
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+    return Response(
+        content="window.__API_BASE__ = '';",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @app.get("/api/uploads/{filename}")
 async def serve_upload(filename: str):
     """提供用户上传的图片（对话中分享的图片），仅允许单层文件名。"""
@@ -854,10 +871,14 @@ async def api_upload_knowledge(
 
 # ---------- 健康检查与久未登录提醒 ----------
 @app.get("/api/check-in")
-async def api_check_in(user_id: int = 1):
-    """用户打开应用时调用：先根据上次登录判断是否久未登录并返回提醒，再更新 last_login。"""
+async def api_check_in(user_id: int = 1, test_reminder: bool = False):
+    """用户打开应用时调用：先根据上次登录判断是否久未登录并返回提醒，再更新 last_login。
+    test_reminder=True 时强制返回一条问候（用于本地测试久未登录效果），不修改 last_login。"""
     conn = await get_db()
     try:
+        if test_reminder:
+            reminder = await get_reminder_if_inactive("2000-01-01 00:00:00")
+            return {"reminder": reminder or "好久不见呀～最近怎么样？"}
         cursor = await conn.execute(
             "SELECT last_login_at FROM users WHERE id = ?", (user_id,)
         )
@@ -871,9 +892,10 @@ async def api_check_in(user_id: int = 1):
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    port = 8000
-    host = "0.0.0.0"
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
     print()
     print("  小伴 · 情感陪伴 已启动")
     print("  在浏览器中打开:  http://127.0.0.1:%s" % port)

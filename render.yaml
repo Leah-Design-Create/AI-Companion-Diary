@@ -1,0 +1,23 @@
+# Render Blueprint - 树洞日记 · 情感陪伴 AI
+# 文档: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: ai-companion-diary
+    runtime: python
+    region: singapore  # 可选: oregon, frankfurt, singapore
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      # 以下在 Render 控制台中添加为 Secret / Environment 变量，勿提交到仓库：
+      # OPENAI_API_KEY (必填)
+      # OPENAI_BASE_URL (可选，默认 OpenAI)
+      # OPENAI_MODEL (可选，默认 gpt-4o-mini)
+      # OPENAI_EMBEDDING_MODEL (可选，RAG 语义检索)
+      # DB_PATH (可选，默认 companion.db；注意 Render 磁盘非持久，重启会清空)
+      # INACTIVE_DAYS_FOR_REMINDER (可选，默认 2)
+      # DASHSCOPE_API_KEY / DASHSCOPE_TTS_MODEL / DASHSCOPE_TTS_VOICE (可选，TTS)
