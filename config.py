@@ -16,6 +16,16 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 # 示例：OpenAI text-embedding-3-small；通义 text-embedding-v3
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "")
 
+# RAG 知识库上传上限（整文件读入内存；过大易 MemoryError，可改大或拆文件）
+MAX_KNOWLEDGE_UPLOAD_BYTES = int(os.getenv("MAX_KNOWLEDGE_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+MAX_KNOWLEDGE_TEXT_CHARS = int(os.getenv("MAX_KNOWLEDGE_TEXT_CHARS", str(2_000_000)))
+
+# 长期记忆（ChromaDB）
+CHROMA_DIR = os.getenv("CHROMA_DIR", ".chroma")
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "chat_long_memory")
+LONG_MEMORY_TOP_K = int(os.getenv("LONG_MEMORY_TOP_K", "4"))
+LONG_MEMORY_MAX_CHARS = int(os.getenv("LONG_MEMORY_MAX_CHARS", "700"))
+
 # 通义 TTS（DashScope）
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 DASHSCOPE_TTS_MODEL = os.getenv("DASHSCOPE_TTS_MODEL", "")

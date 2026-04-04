@@ -1,6 +1,6 @@
 # 树洞日记 · 情感陪伴 AI
 
-一款情感陪伴类产品：以**树洞**为形象，陪聊天、倾听生活、支持图片分享；内置**意图识别 + RAG 知识库**，可引用你上传的书/文章；每次对话可生成**生活记录**总结，并识别**当日心情**与**每条日记当时的心情**；久未登录时会主动问候。
+一款情感陪伴类产品：以**树洞**为形象，陪聊天、倾听生活、支持图片分享；内置**意图识别 + RAG 知识库**，可引用你上传的书/文章；支持基于 **ChromaDB 的长期记忆**（检索历史对话片段）；每次对话可生成**生活记录**总结，并识别**当日心情**与**每条日记当时的心情**；久未登录时会主动问候。
 
 前端为「树洞日记」风格：左侧会话列表（多话题、可新建/重命名/删除）、中间说话区、右侧日记页带日历与详情查看。
 
@@ -13,6 +13,7 @@
 | **日常陪聊** | 树洞以温暖、口语化方式回复；支持文字与图片，多轮对话。 |
 | **多会话管理** | 左侧栏展示历史话题，可新建对话、重命名、删除；切换会话继续上次对话。 |
 | **意图识别 + RAG** | 自动判断「闲聊」或「问知识库」；问知识库时从后台检索你上传的文档并引用，用户无感知。 |
+| **长期记忆（ChromaDB）** | 每轮对话写入向量库，后续聊天会按语义召回历史片段，提升跨会话连续性。 |
 | **焦虑分析** | 会话结束时分析是否存在焦虑/压力，并在该条日记上标记，后续回复更偏共情。 |
 | **心情识别** | 按**当天**所有对话综合显示「今日心情」（聊天页右上角）；每条**日记卡片**右下角显示该次对话的当时心情。 |
 | **生活记录（日记）** | 会话结束后生成简短总结；日记页右侧有日历，点击有记录的日期可定位，支持「查看详情」打开当天聊天记录。 |
@@ -61,6 +62,9 @@ cp .env.example .env
 **RAG 语义检索（可选）**  
 在 `.env` 中增加 `OPENAI_EMBEDDING_MODEL`（如通义 `text-embedding-v3`、OpenAI `text-embedding-3-small`），并重新上传知识库文档后，RAG 会按语义检索；未配置时使用关键词检索。
 
+**长期记忆（可选）**  
+默认使用 ChromaDB 持久化历史对话向量（目录默认 `.chroma`）。可通过 `CHROMA_DIR`、`CHROMA_COLLECTION`、`LONG_MEMORY_TOP_K` 调整存储目录、集合名和召回条数。
+
 **TTS（可选）**  
 如需高品质朗读，可配置 `DASHSCOPE_API_KEY`、`DASHSCOPE_TTS_MODEL`、`DASHSCOPE_TTS_VOICE`；不配置时使用浏览器自带朗读。
 
@@ -101,6 +105,7 @@ python main.py
 │   ├── embedding.py     # 向量嵌入（RAG 语义检索）
 │   ├── intent.py        # 意图识别（闲聊 vs 问知识库）
 │   ├── rag.py           # 知识库检索（关键词 + 语义）
+│   ├── long_memory.py   # 长期记忆（ChromaDB 历史对话存储与召回）
 │   ├── anxiety.py       # 焦虑/压力检测
 │   ├── mood.py          # 心情识别（当日 / 单次会话）
 │   ├── summary.py       # 会话总结生成
@@ -140,6 +145,7 @@ python main.py
 | `POST /api/knowledge` | 添加知识。请求体：`{ "title", "content", "source_url" }`。 |
 | `DELETE /api/knowledge/{kid}` | 删除某条知识。 |
 | `GET /api/debug/rag?q=...` | 调试：查看问题 `q` 会检索到的 RAG 内容。 |
+| `GET /api/debug/memory?q=...&user_id=1&session_id=...` | 调试：查看问题 `q` 会召回的长期记忆片段。 |
 
 ---
 
@@ -151,6 +157,10 @@ python main.py
 | `OPENAI_BASE_URL` | API 基地址 | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | 模型名 | `gpt-4o-mini` |
 | `OPENAI_EMBEDDING_MODEL` | 嵌入模型（RAG 语义检索） | 空则仅关键词 |
+| `CHROMA_DIR` | ChromaDB 持久化目录（长期记忆） | `.chroma` |
+| `CHROMA_COLLECTION` | 长期记忆集合名 | `chat_long_memory` |
+| `LONG_MEMORY_TOP_K` | 每轮聊天召回的历史片段条数 | `4` |
+| `LONG_MEMORY_MAX_CHARS` | 单条写入长期记忆时截断长度 | `320` |
 | `DB_PATH` | SQLite 库路径 | `companion.db` |
 | `INACTIVE_DAYS_FOR_REMINDER` | 超过几天未登录触发问候 | `2` |
 | `DASHSCOPE_API_KEY` | 通义 TTS（可选） | 空则用浏览器朗读 |
@@ -165,6 +175,7 @@ python main.py
 3. **心情**：聊天页右上角为**当日综合心情**（按当天所有对话计算）；切换会话不会变，以天为单位。
 4. **知识库**：访问 http://127.0.0.1:8000/upload 上传书或文章，聊天时自动在后端引用，用户端不展示该入口。
 5. **久未登录**：超过配置天数未访问时，下次打开会请求 `GET /api/check-in`，满足条件则展示树洞问候。
+6. **长期记忆回填（一次性）**：如果你在接入 Chroma 前已经有很多历史聊天，可执行 `python scripts/backfill_long_memory.py --limit 2000` 把旧 `messages` 写入向量库；下次可用 `--since-id` 增量回填。
 
 ---
 

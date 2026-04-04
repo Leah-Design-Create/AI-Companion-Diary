@@ -7,6 +7,9 @@
 *.db
 companion.db
 
+# 向量记忆数据库（本地生成，含用户数据）
+.chroma/
+
 # 用户上传的对话图片
 uploads/
 

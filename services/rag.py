@@ -7,6 +7,13 @@ from config import DB_PATH
 
 from services.embedding import get_embedding
 
+try:
+    import jieba
+    _JIEBA_OK = True
+    jieba.setLogLevel(60)  # 关掉 jieba 初始化日志
+except ImportError:
+    _JIEBA_OK = False
+
 # 单条片段最大字符数（「有哪些」「几种」等问列表时需足够长才能包含完整列举）
 SNIPPET_MAX_LEN = 4500
 
@@ -23,28 +30,50 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+_KW_STOPWORDS = frozenset({
+    "想", "知道", "是", "的", "你", "我", "有", "吗", "什么", "怎么", "如何", "哪些",
+    "告诉", "认识", "谁", "了", "在", "也", "都", "就", "但", "和", "或", "与",
+    "一", "一个", "一些", "这", "那", "这个", "那个", "他", "她", "它", "们",
+    "为", "为什么", "因为", "所以", "可以", "能", "会", "要", "不", "没有",
+})
+
+
 def _extract_keywords(text: str, max_keywords: int = 20) -> list[str]:
-    """从用户输入中提取检索用关键词，兼容中文（无空格）：用 2～3 字滑动窗口切分。"""
-    s = (text or "").replace("，", " ").replace("。", " ").replace("！", " ").replace("？", " ").strip()
+    """从用户输入中提取检索用关键词。优先使用 jieba 分词，回退到滑动窗口。"""
+    s = (text or "").strip()
     if not s:
         return []
+    if _JIEBA_OK:
+        words = jieba.cut(s)
+        seen: set[str] = set()
+        out: list[str] = []
+        for w in words:
+            w = w.strip()
+            if len(w) >= 2 and w not in _KW_STOPWORDS and w not in seen:
+                seen.add(w)
+                out.append(w)
+                if len(out) >= max_keywords:
+                    break
+        return out
+    # 回退：空格分词 + 2-3 字滑动窗口（原实现）
+    s = s.replace("，", " ").replace("。", " ").replace("！", " ").replace("？", " ")
     parts = [p.strip() for p in s.split() if len(p.strip()) >= 2]
-    seen = set()
-    out = []
+    seen2: set[str] = set()
+    out2: list[str] = []
     for p in parts:
-        if p not in seen and len(p) <= 20:
-            seen.add(p)
-            out.append(p)
+        if p not in seen2 and len(p) <= 20:
+            seen2.add(p)
+            out2.append(p)
         if len(p) >= 3:
             for n in (3, 2):
                 for i in range(0, len(p) - n + 1):
-                    w = p[i : i + n]
-                    if w not in seen:
-                        seen.add(w)
-                        out.append(w)
-                        if len(out) >= max_keywords:
-                            return out[:max_keywords]
-    return out[:max_keywords]
+                    w = p[i: i + n]
+                    if w not in seen2:
+                        seen2.add(w)
+                        out2.append(w)
+                        if len(out2) >= max_keywords:
+                            return out2[:max_keywords]
+    return out2[:max_keywords]
 
 
 def _score_snippet(snippet: str, keywords: list[str]) -> int:
@@ -83,11 +112,11 @@ def _best_snippet(content: str, keywords: list[str], max_len: int) -> str:
     return text[start:end]
 
 
-async def _knowledge_by_semantic(conn, user_input: str, limit: int, keywords: list[str]) -> list[str]:
-    """用查询向量与知识库 embedding 做余弦相似度，返回最相关的 limit 条。失败或无向量时返回 []。"""
+async def _knowledge_by_semantic(conn, user_input: str, limit: int, keywords: list[str]) -> tuple[list[str], float]:
+    """用查询向量与知识库 embedding 做余弦相似度，返回 (最相关的 limit 条, 最高相似度)。失败或无向量时返回 ([], 0.0)。"""
     query_emb = await get_embedding(user_input)
     if not query_emb:
-        return []
+        return [], 0.0
     try:
         cursor = await conn.execute(
             """SELECT title, content, embedding FROM knowledge WHERE embedding IS NOT NULL AND embedding != ''"""
@@ -95,10 +124,10 @@ async def _knowledge_by_semantic(conn, user_input: str, limit: int, keywords: li
         rows = await cursor.fetchall()
     except Exception as e:
         print(f"[RAG] 语义检索跳过（表无 embedding 或查询失败）: {e}")
-        return []
+        return [], 0.0
     if not rows:
         print("[RAG] 语义检索未命中：知识库暂无向量，请到 /upload 重新上传文档以生成 embedding")
-        return []
+        return [], 0.0
     scored: list[tuple[float, str]] = []
     for r in rows:
         try:
@@ -116,7 +145,8 @@ async def _knowledge_by_semantic(conn, user_input: str, limit: int, keywords: li
         if snippet:
             scored.append((sim, snippet))
     scored.sort(key=lambda x: -x[0])
-    return [s for _, s in scored[:limit]]
+    best_score = scored[0][0] if scored else 0.0
+    return [s for _, s in scored[:limit]], best_score
 
 
 async def _knowledge_by_keywords(conn, keywords: list[str], limit: int) -> list[tuple[int, str]]:
@@ -143,35 +173,29 @@ async def _knowledge_by_keywords(conn, keywords: list[str], limit: int) -> list[
     return scored[:limit]
 
 
-async def get_relevant_context(user_input: str, user_id: int = 1, limit: int = 8) -> tuple[list[str], str]:
-    """优先语义检索（需配置 OPENAI_EMBEDDING_MODEL 且知识库有 embedding），否则用关键词检索。返回 (片段列表, "semantic"|"keyword")。"""
+async def get_relevant_context(user_input: str, user_id: int = 1, limit: int = 8) -> tuple[list[str], str, float]:
+    """优先语义检索（需配置 OPENAI_EMBEDDING_MODEL 且知识库有 embedding），否则用关键词检索。
+    返回 (片段列表, "semantic"|"keyword", 最佳相关度分数)。
+    语义模式：分数为余弦相似度 [0,1]；关键词模式：分数为最佳匹配关键词数。
+    """
     if not user_input.strip():
-        return [], "keyword"
+        return [], "keyword", 0.0
     keywords = _extract_keywords(user_input)
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
     mode = "keyword"
+    best_score = 0.0
     try:
-        # 1) 知识库：先尝试语义检索，没有再关键词（都按「含关键词的片段」截取，避免只看到文档开头）
-        out: list[str] = await _knowledge_by_semantic(conn, user_input, limit, keywords)
+        # 1) 先尝试语义检索
+        out, best_score = await _knowledge_by_semantic(conn, user_input, limit, keywords)
         if out:
             mode = "semantic"
         else:
+            # 2) 回退到关键词检索
             kw_results = await _knowledge_by_keywords(conn, keywords, limit)
             out = [s for _, s in kw_results]
-        if not out and keywords:
-            cursor = await conn.execute(
-                """SELECT title, content FROM knowledge ORDER BY id DESC LIMIT 2"""
-            )
-            for r in await cursor.fetchall():
-                title = r["title"] or ""
-                raw = r["content"] or ""
-                part = _best_snippet(raw, keywords, SNIPPET_MAX_LEN) or raw[:SNIPPET_MAX_LEN]
-                snippet = (title + "\n" + part).strip()
-                if snippet and snippet not in out:
-                    out.append(snippet)
+            best_score = float(kw_results[0][0]) if kw_results else 0.0
 
-        # 只返回知识库内容，不混入「近期对话总结」——总结由模型之前生成，可能含错误（如 5-4-3-2-1 法），不能当事实依据
-        return out[:limit], mode
+        return out[:limit], mode, best_score
     finally:
         await conn.close()

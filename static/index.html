@@ -282,6 +282,7 @@
     .chat-mood .mood-dot.positive { background: #4ade80; }
     .chat-mood .mood-dot.neutral { background: #94a3b8; }
     .chat-mood .mood-dot.negative { background: #f59e0b; }
+    .chat-weather { font-size: 12px; color: var(--ink-muted); display: flex; align-items: center; gap: 4px; cursor: default; }
     .chat-messages {
       flex: 1;
       min-height: 0;
@@ -342,14 +343,13 @@
       vertical-align: middle;
     }
     .btn-read:hover { background: var(--accent-warm); color: var(--ink); }
-    .typing .bubble { display: flex; gap: 4px; align-items: center; }
-    .typing-dot {
-      width: 6px; height: 6px; border-radius: 50%; background: var(--ink-light);
-      animation: typing-bounce 1s ease-in-out infinite;
+    .typing .bubble { background: transparent !important; box-shadow: none !important; border: none !important; padding: 4px 0 !important; }
+    .typing-label { font-size: 0.78rem; color: var(--ink-light); }
+    .typing-dots::after {
+      content: '';
+      animation: typing-ellipsis 1.2s steps(4, end) infinite;
     }
-    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
-    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes typing-bounce { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+    @keyframes typing-ellipsis { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
     .reminder-banner {
       margin: 0 24px 16px;
       padding: 12px 16px;
@@ -581,9 +581,332 @@
     .summary-card .card-mood .mood-dot.negative { background: #f59e0b; }
     .summary-card .card-mood-empty { color: var(--ink-light); }
     .empty-state { text-align: center; padding: 60px 20px; color: var(--ink-muted); }
+
+    /* ===== 情绪周报 ===== */
+    #reportPanel { overflow-y: auto; padding: 32px 28px 56px; -webkit-overflow-scrolling: touch; background: var(--bg-warm); }
+    .report-inner { max-width: 720px; margin: 0 auto; }
+
+    /* 顶部 Hero */
+    .report-hero { background: linear-gradient(135deg, #FFF8EE 0%, #FDF3E4 100%); border: 1px solid #F0E6D3; border-radius: 20px; padding: 28px 32px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    .report-hero-left h1 { font-family: 'Noto Serif SC', serif; font-size: 1.6rem; font-weight: 500; margin-bottom: 4px; }
+    .report-hero-left .report-date-range { font-size: 0.88rem; color: var(--ink-muted); margin-bottom: 16px; }
+    .report-week-nav { display: flex; align-items: center; gap: 8px; }
+    .report-week-nav button { background: white; border: 1px solid #E8DDD0; border-radius: 20px; padding: 6px 16px; cursor: pointer; color: var(--ink-muted); font-size: 0.82rem; font-family: inherit; transition: all 0.15s; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+    .report-week-nav button:hover:not(:disabled) { background: var(--accent-warm); color: var(--ink); border-color: var(--accent-warm); }
+    .report-week-nav button:disabled { opacity: 0.35; cursor: default; }
+    .report-hero-right { font-size: 3rem; line-height: 1; opacity: 0.6; flex-shrink: 0; }
+
+    /* 统计卡片 */
+    .report-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+    @media (max-width: 560px) { .report-stats { grid-template-columns: repeat(2, 1fr); } }
+    .stat-card { border-radius: 16px; padding: 18px 14px; text-align: center; border: 1px solid transparent; }
+    .stat-card.sc-green  { background: #F0FDF4; border-color: #D1FAE5; }
+    .stat-card.sc-yellow { background: #FFFBEB; border-color: #FDE68A; }
+    .stat-card.sc-blue   { background: #EFF6FF; border-color: #BFDBFE; }
+    .stat-card.sc-purple { background: #FAF5FF; border-color: #E9D5FF; }
+    .stat-card .stat-icon { font-size: 1.4rem; margin-bottom: 6px; }
+    .stat-card .stat-val { font-size: 1.7rem; font-weight: 700; color: var(--ink); line-height: 1; }
+    .stat-card .stat-label { font-size: 0.72rem; color: var(--ink-muted); margin-top: 5px; }
+
+    /* 内容卡片 */
+    .report-card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 22px 24px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+    .report-card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; }
+    .report-card-title .card-icon { font-size: 1.1rem; }
+    .report-card-title h2 { font-size: 0.88rem; font-weight: 600; color: var(--ink-muted); letter-spacing: 0.04em; text-transform: uppercase; }
+
+    /* 情绪曲线 */
+    .mood-chart-wrap { width: 100%; overflow-x: auto; }
+    .mood-chart-wrap svg { display: block; width: 100%; height: auto; min-width: 300px; }
+
+    /* 关键词云 */
+    .kw-cloud { display: flex; flex-wrap: wrap; gap: 8px; line-height: 1.4; align-items: baseline; }
+    .kw-tag { display: inline-block; padding: 4px 12px; border-radius: 20px; cursor: default; transition: filter 0.15s; font-weight: 400; }
+    .kw-tag:hover { filter: brightness(0.94); }
+    .kw-tag.kw-a { background: #FEF3C7; color: #92400E; }
+    .kw-tag.kw-b { background: #DBEAFE; color: #1E40AF; }
+    .kw-tag.kw-c { background: #D1FAE5; color: #065F46; }
+    .kw-tag.kw-d { background: #EDE9FE; color: #5B21B6; }
+    .kw-tag.kw-e { background: #FCE7F3; color: #9D174D; }
+
+    /* 高光/建议 */
+    .report-prose { font-size: 0.95rem; color: var(--ink); line-height: 1.85; white-space: pre-wrap; padding-left: 16px; border-left: 3px solid; border-radius: 2px; }
+    .report-prose.prose-gold { border-color: #F59E0B; }
+    .report-prose.prose-green { border-color: #34D399; }
+
+    /* 加载 */
+    .report-loading { text-align: center; padding: 80px 20px; color: var(--ink-muted); font-size: 0.9rem; }
+
+    /* ===== 搜索 ===== */
+    .diary-search-wrap { display: flex; gap: 8px; margin-bottom: 24px; }
+    .diary-search-input { flex: 1; padding: 9px 16px; border: 1px solid var(--border); border-radius: 20px; background: var(--card); font-family: inherit; font-size: 0.9rem; color: var(--ink); outline: none; transition: border-color 0.15s; }
+    .diary-search-input:focus { border-color: #94A3B8; }
+    .diary-search-input::placeholder { color: var(--ink-light); }
+    .btn-search-clear { background: none; border: none; cursor: pointer; color: var(--ink-light); font-size: 1.1rem; padding: 0 4px; display: none; }
+    .btn-search-clear.show { display: block; }
+
+    /* ===== 导出按钮 ===== */
+    .btn-export { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid var(--border); border-radius: 20px; background: var(--card); color: var(--ink-muted); font-size: 0.8rem; font-family: inherit; cursor: pointer; transition: all 0.15s; text-decoration: none; }
+    .btn-export:hover { background: var(--ai-bubble); color: var(--ink); }
+
+    /* ===== 热力图日历颜色 ===== */
+    .cal-day.mood-positive { background: #D1FAE5 !important; color: #065F46 !important; }
+    .cal-day.mood-negative { background: #FEF3C7 !important; color: #92400E !important; }
+    .cal-day.mood-neutral  { background: #E2E8F0 !important; color: #475569 !important; }
+    [data-theme="dark"] .cal-day.mood-positive { background: #14261e !important; color: #6EE7B7 !important; }
+    [data-theme="dark"] .cal-day.mood-negative { background: #2d1f0a !important; color: #FCD34D !important; }
+    [data-theme="dark"] .cal-day.mood-neutral  { background: #1e2530 !important; color: #94A3B8 !important; }
+
+    /* ===== 深色模式 ===== */
+    [data-theme="dark"] {
+      --bg-warm: #1C1917;
+      --ai-bubble: #292524;
+      --accent-warm: #44403C;
+      --accent-warm-hover: #57534E;
+      --ink: #E7E5E4;
+      --ink-muted: #A8A29E;
+      --ink-light: #78716C;
+      --border: rgba(255,255,255,0.08);
+      --card: #231F1D;
+    }
+    [data-theme="dark"] nav.nav-main { background: rgba(28,25,23,0.88); }
+    [data-theme="dark"] .input-footer { background: rgba(28,25,23,0.88); }
+    [data-theme="dark"] .sidebar { background: #1C1917; border-right-color: rgba(255,255,255,0.06); }
+    [data-theme="dark"] .report-hero { background: linear-gradient(135deg,#282320,#231F1D); border-color: #3c3530; }
+    [data-theme="dark"] .breathe-overlay { background: #1a1f28; }
+    [data-theme="dark"] .detail-modal { background: var(--card); }
+    [data-theme="dark"] .stat-card.sc-green  { background: #14261e; border-color: #1a3828; }
+    [data-theme="dark"] .stat-card.sc-yellow { background: #262010; border-color: #3a2e0a; }
+    [data-theme="dark"] .stat-card.sc-blue   { background: #101e30; border-color: #152840; }
+    [data-theme="dark"] .stat-card.sc-purple { background: #1e1428; border-color: #2c1e3c; }
+
+    .btn-theme {
+      width: 32px; height: 32px; border-radius: 50%;
+      border: 1px solid var(--border); background: var(--card);
+      color: var(--ink-muted); cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px; transition: background 0.15s;
+    }
+    .btn-theme:hover { background: var(--ai-bubble); }
+
+    /* ===== 移动端 ===== */
+    .sidebar-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 59;
+    }
+    .sidebar-overlay.show { display: block; }
+
+    .btn-hamburger {
+      display: none;
+      background: none; border: none; cursor: pointer;
+      color: var(--ink-muted); padding: 4px;
+    }
+    .btn-hamburger svg { width: 22px; height: 22px; display: block; }
+
+    @media (max-width: 768px) {
+      .sidebar-wrap { position: fixed; top: 0; left: 0; height: 100vh; z-index: 60; }
+      .sidebar { transform: translateX(-100%); transition: transform 0.25s ease, width 0s; width: 280px !important; min-width: 280px !important; }
+      .sidebar.mobile-open { transform: translateX(0); }
+      .sidebar.collapsed { transform: translateX(-100%); }
+      .sidebar-toggle { display: none; }
+      .btn-hamburger { display: flex; align-items: center; justify-content: center; }
+      .nav-logo span { display: none; }
+      .nav-tabs { gap: 20px; }
+      .nav-tabs button { font-size: 14px; }
+      .chat-messages { padding: 12px 16px; }
+      .input-footer { padding: 12px 16px; }
+      .input-inner { max-width: 100%; }
+      #reportPanel { padding: 20px 16px 40px; }
+      .report-stats { grid-template-columns: repeat(2, 1fr); }
+      .diary-calendar-wrap { display: none; }
+    }
+
+    /* ===== 时间戳移到气泡外 ===== */
+    .msg .time {
+      font-size: 0.72rem; color: var(--ink-light);
+      margin-top: 4px;
+      opacity: 0;
+      transition: opacity 0.2s;
+      padding: 0 4px;
+    }
+    .msg:hover .time { opacity: 1; }
+    .msg.bot .time { text-align: left; }
+    .msg.user .time { text-align: right; }
+
+    /* ===== 呼吸练习 ===== */
+    .breathe-card { display: flex; align-items: center; gap: 12px; background: linear-gradient(135deg, #EFF6FF, #DBEAFE); border: 1px solid #BFDBFE; border-radius: 14px; padding: 14px 16px; margin: 8px 0 4px; max-width: 340px; }
+    .breathe-card-icon { font-size: 1.6rem; flex-shrink: 0; }
+    .breathe-card-body { flex: 1; min-width: 0; }
+    .breathe-card-body p { font-size: 0.85rem; color: #1E3A5F; line-height: 1.4; margin-bottom: 8px; }
+    .btn-breathe-start { background: #3B82F6; color: white; border: none; border-radius: 20px; padding: 5px 14px; font-size: 0.8rem; font-family: inherit; cursor: pointer; transition: background 0.15s; }
+    .btn-breathe-start:hover { background: #2563EB; }
+
+    .breathe-overlay { position: fixed; inset: 0; background: #F0F7FF; z-index: 300; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+    .breathe-overlay.show { display: flex; }
+    .breathe-close { position: absolute; top: 20px; right: 20px; background: none; border: none; cursor: pointer; color: #6B7280; font-size: 1.4rem; line-height: 1; padding: 8px; border-radius: 50%; transition: background 0.15s; }
+    .breathe-close:hover { background: rgba(0,0,0,0.06); }
+    .breathe-mute { position: absolute; top: 20px; right: 60px; background: none; border: none; cursor: pointer; font-size: 1.1rem; line-height: 1; padding: 8px; border-radius: 50%; transition: background 0.15s; opacity: 0.7; }
+    .breathe-mute:hover { background: rgba(0,0,0,0.06); opacity: 1; }
+    .breathe-mode-tabs { display: flex; gap: 8px; margin-bottom: 40px; }
+    .breathe-mode-tab { background: white; border: 1px solid #BFDBFE; border-radius: 20px; padding: 6px 18px; font-size: 0.82rem; font-family: inherit; cursor: pointer; color: #3B82F6; transition: all 0.15s; }
+    .breathe-mode-tab.active { background: #3B82F6; color: white; border-color: #3B82F6; }
+    .breathe-phase-label { font-size: 1.1rem; font-weight: 500; color: #1E3A5F; margin-bottom: 28px; height: 1.5em; text-align: center; }
+    .breathe-ring-wrap { position: relative; display: flex; align-items: center; justify-content: center; margin-bottom: 28px; }
+    .breathe-ring { width: 200px; height: 200px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #93C5FD, #3B82F6); box-shadow: 0 0 0 20px rgba(59,130,246,0.1), 0 0 0 40px rgba(59,130,246,0.05); transition: transform 0s linear; }
+    .breathe-count-text { position: absolute; font-size: 2.8rem; font-weight: 300; color: white; font-variant-numeric: tabular-nums; pointer-events: none; }
+    .breathe-cycles { font-size: 0.85rem; color: #6B8CAE; margin-bottom: 32px; }
+    .btn-breathe-toggle { background: white; border: 2px solid #3B82F6; border-radius: 24px; padding: 10px 32px; font-size: 0.95rem; font-family: inherit; color: #3B82F6; cursor: pointer; font-weight: 500; transition: all 0.15s; }
+    .btn-breathe-toggle:hover { background: #3B82F6; color: white; }
+    .breathe-tip { font-size: 0.8rem; color: #94A3B8; margin-top: 20px; text-align: center; max-width: 280px; line-height: 1.5; }
+
+    /* ---- Auth overlay ---- */
+    .auth-overlay {
+      position: fixed; inset: 0; z-index: 9999;
+      background: var(--bg-warm);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .auth-overlay.hidden { display: none; }
+    .auth-card {
+      width: 100%; max-width: 400px;
+      background: var(--card);
+      border-radius: 20px;
+      padding: 40px 36px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.10);
+      border: 1px solid var(--border);
+    }
+    .auth-logo {
+      text-align: center;
+      font-family: 'Noto Serif SC', serif;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 8px;
+    }
+    .auth-logo svg { width: 32px; height: 32px; vertical-align: middle; margin-right: 6px; color: #C8916B; }
+    .auth-subtitle { text-align: center; font-size: 0.85rem; color: var(--ink-muted); margin-bottom: 28px; }
+    .auth-tabs { display: flex; gap: 0; border-radius: 10px; overflow: hidden; background: var(--ai-bubble); margin-bottom: 24px; }
+    .auth-tab {
+      flex: 1; padding: 9px 0; font-size: 0.9rem; border: none; background: none;
+      cursor: pointer; color: var(--ink-muted); font-family: inherit; transition: all 0.15s;
+    }
+    .auth-tab.active { background: var(--card); color: var(--ink); font-weight: 500; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+    .auth-form-group { margin-bottom: 16px; }
+    .auth-form-group label { display: block; font-size: 0.83rem; color: var(--ink-muted); margin-bottom: 6px; }
+    .auth-form-group input {
+      width: 100%; padding: 11px 14px; border: 1px solid var(--border);
+      border-radius: 10px; font-size: 0.95rem; font-family: inherit;
+      background: var(--bg-warm); color: var(--ink);
+      outline: none; transition: border-color 0.15s;
+    }
+    .auth-form-group input:focus { border-color: #C8916B; box-shadow: 0 0 0 2px rgba(200,145,107,0.15); }
+    .btn-auth-submit {
+      width: 100%; padding: 12px; border: none; border-radius: 12px;
+      background: linear-gradient(135deg, #C8916B, #E6A87C);
+      color: white; font-size: 1rem; font-family: inherit;
+      font-weight: 500; cursor: pointer; margin-top: 4px;
+      transition: opacity 0.15s;
+    }
+    .btn-auth-submit:hover { opacity: 0.9; }
+    .auth-error { color: #dc2626; font-size: 0.83rem; margin-top: 10px; text-align: center; min-height: 18px; }
+    .nav-user-name { font-size: 0.82rem; color: var(--ink-muted); max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .btn-logout { padding: 5px 12px; border: 1px solid var(--border); border-radius: 8px; background: none; font-size: 0.8rem; color: var(--ink-muted); cursor: pointer; font-family: inherit; white-space: nowrap; }
+    .btn-logout:hover { background: var(--ai-bubble); }
+    [data-theme="dark"] .auth-overlay { background: #1C1917; }
+    [data-theme="dark"] .auth-card { background: #252220; border-color: rgba(255,255,255,0.08); }
+    [data-theme="dark"] .auth-form-group input { background: #1C1917; border-color: rgba(255,255,255,0.1); color: #E5DDD5; }
+    .settings-overlay {
+      position: fixed; inset: 0; z-index: 9000;
+      background: rgba(0,0,0,0.35);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .settings-overlay.hidden { display: none; }
+    .settings-card {
+      width: 100%; max-width: 420px;
+      background: var(--card);
+      border-radius: 20px;
+      padding: 28px 32px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.15);
+      border: 1px solid var(--border);
+      max-height: 90vh; overflow-y: auto;
+    }
+    .settings-section-title { font-size: 0.88rem; font-weight: 600; color: var(--ink-muted); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .settings-section .auth-form-group { margin-bottom: 12px; }
+    [data-theme="dark"] .settings-card { background: #252220; border-color: rgba(255,255,255,0.08); }
   </style>
 </head>
 <body>
+  <!-- Auth Overlay -->
+  <div class="auth-overlay" id="authOverlay">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22c4.5-2 8-6 8-11a8 8 0 1 0-16 0c0 5 3.5 9 8 11z"/></svg>
+        树洞日记
+      </div>
+      <p class="auth-subtitle">你的私密情感空间，只属于你</p>
+      <div class="auth-tabs">
+        <button class="auth-tab active" id="tabLogin" onclick="switchAuthTab('login')">登录</button>
+        <button class="auth-tab" id="tabRegister" onclick="switchAuthTab('register')">注册</button>
+      </div>
+      <!-- 登录表单 -->
+      <div id="loginForm">
+        <div class="auth-form-group">
+          <label>邮箱</label>
+          <input type="email" id="loginEmail" placeholder="your@email.com" autocomplete="email" />
+        </div>
+        <div class="auth-form-group">
+          <label>密码</label>
+          <input type="password" id="loginPassword" placeholder="输入密码" autocomplete="current-password" />
+        </div>
+        <button class="btn-auth-submit" onclick="doLogin()">登录</button>
+      </div>
+      <!-- 注册表单 -->
+      <div id="registerForm" style="display:none">
+        <div class="auth-form-group">
+          <label>邮箱</label>
+          <input type="email" id="regEmail" placeholder="your@email.com" autocomplete="email" />
+        </div>
+        <div class="auth-form-group">
+          <label>昵称（可选）</label>
+          <input type="text" id="regName" placeholder="你想让小伴怎么称呼你" autocomplete="nickname" />
+        </div>
+        <div class="auth-form-group">
+          <label>密码（至少 6 位）</label>
+          <input type="password" id="regPassword" placeholder="设置密码" autocomplete="new-password" />
+        </div>
+        <button class="btn-auth-submit" onclick="doRegister()">创建账号</button>
+      </div>
+      <div class="auth-error" id="authError"></div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="settings-overlay hidden" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
+    <div class="settings-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+        <h3 style="font-size:1.05rem;font-weight:600;">账号设置</h3>
+        <button onclick="closeSettings()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;color:var(--ink-muted);line-height:1;">×</button>
+      </div>
+      <!-- 修改密码 -->
+      <div class="settings-section">
+        <div class="settings-section-title">修改密码</div>
+        <div class="auth-form-group"><label>当前密码</label><input type="password" id="cpCurrent" placeholder="输入当前密码" /></div>
+        <div class="auth-form-group"><label>新密码（至少 6 位）</label><input type="password" id="cpNew" placeholder="输入新密码" /></div>
+        <div class="auth-form-group"><label>确认新密码</label><input type="password" id="cpConfirm" placeholder="再次输入新密码" /></div>
+        <button class="btn-auth-submit" style="margin-top:4px;" onclick="doChangePassword()">保存新密码</button>
+        <div class="auth-error" id="cpError"></div>
+      </div>
+      <!-- 注销账号 -->
+      <div class="settings-section" style="margin-top:24px;border-top:1px solid var(--border);padding-top:20px;">
+        <div class="settings-section-title" style="color:#dc2626;">注销账号</div>
+        <p style="font-size:0.83rem;color:var(--ink-muted);margin-bottom:14px;line-height:1.6;">注销后将永久删除你的所有对话记录、日记和账号信息，无法恢复。</p>
+        <div class="auth-form-group"><label>输入密码确认</label><input type="password" id="delPassword" placeholder="输入密码以确认注销" /></div>
+        <button onclick="doDeleteAccount()" style="width:100%;padding:11px;border:1px solid #dc2626;border-radius:10px;background:none;color:#dc2626;font-size:0.95rem;font-family:inherit;cursor:pointer;margin-top:4px;transition:all 0.15s;" onmouseover="this.style.background='#dc2626';this.style.color='white'" onmouseout="this.style.background='none';this.style.color='#dc2626'">永久注销账号</button>
+        <div class="auth-error" id="delError"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="app-wrap">
     <div class="sidebar-wrap">
       <aside class="sidebar" id="sidebar">
@@ -615,15 +938,23 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22c4.5-2 8-6 8-11a8 8 0 1 0-16 0c0 5 3.5 9 8 11z"/></svg>
             树洞日记
           </div>
+          <button class="btn-hamburger" id="btnHamburger" aria-label="菜单">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
           <div class="nav-tabs">
             <button type="button" class="nav-tab active" data-panel="chatPanel">说话</button>
             <button type="button" class="nav-tab" data-panel="notesPanel">日记</button>
+            <button type="button" class="nav-tab" data-panel="reportPanel">周报</button>
           </div>
-          <div class="nav-user">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <div style="display:flex;align-items:center;gap:8px;">
+          <button class="btn-theme" id="btnTheme" title="切换深色/浅色">🌙</button>
+          <span class="nav-user-name" id="navUserName"></span>
+          <button class="btn-logout" id="btnSettings" onclick="openSettings()" style="display:none" title="账号设置">⚙</button>
+          <button class="btn-logout" id="btnLogout" onclick="doLogout()" style="display:none">退出</button>
           </div>
         </div>
       </nav>
+      <div class="sidebar-overlay" id="sidebarOverlay"></div>
 
       <div class="main-wrap">
         <main class="content-main">
@@ -631,18 +962,31 @@
             <div id="reminderBanner" class="reminder-banner" style="display:none;"></div>
             <div class="chat-header">
               <span class="chat-date" id="chatDate"></span>
-              <div class="chat-mood" id="chatMood" title="今日心情">
-                <span class="mood-dot positive" id="moodDot"></span>
-                <span id="moodText">平静</span>
+              <div style="display:flex;align-items:center;gap:12px;">
+                <div class="chat-weather" id="chatWeather" style="display:none;"></div>
+                <div class="chat-mood" id="chatMood" title="今日心情">
+                  <span class="mood-dot positive" id="moodDot"></span>
+                  <span id="moodText">平静</span>
+                </div>
               </div>
             </div>
             <div class="messages chat-messages" id="messages"></div>
           </section>
           <section id="notesPanel" class="panel">
             <div class="diary-content">
-              <div class="diary-header">
-                <h1>往日树洞</h1>
-                <p>在这里回顾你曾对树洞倾诉的点滴。</p>
+              <div class="diary-header" style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div>
+                  <h1>往日树洞</h1>
+                  <p>在这里回顾你曾对树洞倾诉的点滴。</p>
+                </div>
+                <a class="btn-export" id="btnExport" href="#" download>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  导出
+                </a>
+              </div>
+              <div class="diary-search-wrap">
+                <input class="diary-search-input" id="diarySearchInput" type="text" placeholder="搜索记录…" />
+                <button class="btn-search-clear" id="btnSearchClear">×</button>
               </div>
               <div class="summaries-list" id="summariesList"></div>
               <div id="summariesEmpty" class="empty-state">暂无记录，多和树洞说说话就会自动生成哦～</div>
@@ -657,6 +1001,42 @@
               <div class="cal-days" id="calDays"></div>
             </div>
           </section>
+          <section id="reportPanel" class="panel">
+            <div class="report-inner">
+              <div class="report-hero">
+                <div class="report-hero-left">
+                  <h1>情绪周报</h1>
+                  <div class="report-date-range" id="reportWeekLabel">—</div>
+                  <div class="report-week-nav">
+                    <button type="button" id="reportPrev">‹ 上周</button>
+                    <button type="button" id="reportNext">下周 ›</button>
+                  </div>
+                </div>
+                <div class="report-hero-right">🌿</div>
+              </div>
+              <div id="reportLoading" class="report-loading">加载中…</div>
+              <div id="reportContent" style="display:none;">
+                <div class="report-stats" id="reportStats"></div>
+                <div class="report-card">
+                  <div class="report-card-title"><span class="card-icon">📈</span><h2>情绪曲线</h2></div>
+                  <div class="mood-chart-wrap" id="reportMoodChart"></div>
+                </div>
+                <div class="report-card">
+                  <div class="report-card-title"><span class="card-icon">💬</span><h2>本周高频词</h2></div>
+                  <div class="kw-cloud" id="reportKeywords"></div>
+                </div>
+                <div class="report-card">
+                  <div class="report-card-title"><span class="card-icon">✨</span><h2>高光时刻</h2></div>
+                  <div class="report-prose prose-gold" id="reportHighlights"></div>
+                </div>
+                <div class="report-card">
+                  <div class="report-card-title"><span class="card-icon">🌱</span><h2>成长建议</h2></div>
+                  <div class="report-prose prose-green" id="reportSuggestions"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <div class="detail-modal-overlay" id="detailModalOverlay">
             <div class="detail-modal">
               <div class="modal-header">
@@ -667,6 +1047,24 @@
             </div>
           </div>
         </main>
+      </div>
+
+      <!-- 呼吸练习覆盖层 -->
+      <div class="breathe-overlay" id="breatheOverlay">
+        <button class="breathe-close" id="breatheClose" aria-label="关闭">×</button>
+        <button class="breathe-mute" id="breatheMute" title="静音">🔔</button>
+        <div class="breathe-mode-tabs">
+          <button class="breathe-mode-tab active" data-mode="478">4-7-8 呼吸</button>
+          <button class="breathe-mode-tab" data-mode="box">方形呼吸</button>
+        </div>
+        <div class="breathe-phase-label" id="breathePhaseLabel">准备好了吗</div>
+        <div class="breathe-ring-wrap">
+          <div class="breathe-ring" id="breatheRing"></div>
+          <span class="breathe-count-text" id="breatheCountText"></span>
+        </div>
+        <div class="breathe-cycles" id="breatheCycles">第 0 轮</div>
+        <button class="btn-breathe-toggle" id="breatheToggle">开始</button>
+        <p class="breathe-tip" id="breatheTip">4-7-8 呼吸法：吸气 4 秒 → 屏住 7 秒 → 呼气 8 秒，有效缓解即时焦虑</p>
       </div>
 
       <footer class="input-footer">
@@ -699,7 +1097,7 @@
   <script src="/config.js"></script>
   <script>
     const API_BASE = (typeof window.__API_BASE__ === 'string') ? window.__API_BASE__ : ((typeof window !== 'undefined' && window.location.protocol === 'file:') ? 'http://127.0.0.1:8000' : '');
-    const userId = 1;
+    let userId = null;   // 登录后由 /api/auth/me 设置
     let sessionId = null;
     let isLoading = false;
     let pendingImage = null;
@@ -745,7 +1143,7 @@
       if (!list) return [];
       list.innerHTML = '';
       try {
-        const r = await fetch(`${API_BASE}/api/sessions?user_id=${userId}&limit=50`);
+        const r = await apiFetch('/api/sessions?limit=50');
         const arr = await r.json();
         if (!arr || arr.length === 0) return [];
         arr.forEach(s => {
@@ -771,7 +1169,7 @@
       if (newTitle === null) return;
       const title = newTitle.trim();
       try {
-        const r = await fetch(`${API_BASE}/api/sessions/${sid}?user_id=${userId}`, {
+        const r = await apiFetch(`/api/sessions/${sid}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title: title || '' }),
@@ -783,7 +1181,7 @@
     async function deleteSession(sid) {
       if (!window.confirm('确定要删除这条对话吗？删除后无法恢复。')) return;
       try {
-        const r = await fetch(`${API_BASE}/api/sessions/${sid}?user_id=${userId}`, { method: 'DELETE' });
+        const r = await apiFetch(`/api/sessions/${sid}`, { method: 'DELETE' });
         if (r.ok) {
           if (sessionId === sid) { sessionId = null; document.getElementById('messages').innerHTML = ''; }
           loadSessions();
@@ -823,7 +1221,7 @@
         if (role === 'bot') {
           msg.innerHTML = `<div class="avatar">🌳</div><div class="bubble">${escapeHtml(content)} <button type="button" class="btn-read" title="朗读回复" data-text="${escapeHtml(content)}">朗读</button><div class="time">${time}</div></div>`;
           const readBtn = msg.querySelector('.btn-read');
-          if (readBtn) readBtn.addEventListener('click', () => speakText(readBtn.getAttribute('data-text') || ''));
+          if (readBtn) readBtn.addEventListener('click', () => speakText(readBtn.getAttribute('data-text') || '', readBtn));
         } else {
           let bubbleContent = escapeHtml(content);
           if (opts.imagePath) bubbleContent += '<img class="msg-img" src="' + escapeHtml(API_BASE + '/api/uploads/' + opts.imagePath) + '" alt="分享的图片" />';
@@ -836,7 +1234,7 @@
 
     async function loadSessionMessages(sid) {
       try {
-        const r = await fetch(`${API_BASE}/api/sessions/${sid}/messages?user_id=${userId}`);
+        const r = await apiFetch(`/api/sessions/${sid}/messages`);
         if (!r.ok) return;
         const messages = await r.json();
         renderMessages(messages);
@@ -870,15 +1268,16 @@
         btn.classList.add('active');
         const panel = document.getElementById(panelId);
         if (panel) panel.classList.add('active');
-        if (inputFooter) inputFooter.classList.toggle('hide', panelId === 'notesPanel');
+        if (inputFooter) inputFooter.classList.toggle('hide', panelId !== 'chatPanel');
         if (panelId === 'notesPanel') loadSummaries();
         if (panelId === 'chatPanel') fetchTodayMood();
+        if (panelId === 'reportPanel') loadWeeklyReport();
       });
     });
 
     async function checkIn() {
       try {
-        const r = await fetch(`${API_BASE}/api/check-in?user_id=${userId}`);
+        const r = await apiFetch('/api/check-in');
         const d = await r.json();
         if (d.reminder) {
           const el = document.getElementById('reminderBanner');
@@ -904,11 +1303,11 @@
       if (opts.imageUrl) bubbleContent += '<img class="msg-img" src="' + escapeHtml(opts.imageUrl) + '" alt="分享的图片" />';
       if (opts.imagePath) bubbleContent += '<img class="msg-img" src="' + escapeHtml(API_BASE + '/api/uploads/' + opts.imagePath) + '" alt="分享的图片" />';
       if (isTyping) {
-        msg.innerHTML = '<div class="avatar">🌳</div><div class="bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>';
+        msg.innerHTML = '<div class="avatar">🌳</div><div class="bubble"><span class="typing-label">小伴正在输入<span class="typing-dots"></span></span></div>';
       } else {
         msg.innerHTML = role === 'bot'
-          ? '<div class="avatar">🌳</div><div class="bubble">' + bubbleContent + '<div class="time">' + time + '</div></div>'
-          : '<div class="avatar"></div><div class="bubble">' + bubbleContent + '<div class="time">' + time + '</div></div>';
+          ? '<div class="avatar">🌳</div><div style="display:contents"><div class="bubble">' + bubbleContent + '</div><div class="time">' + time + '</div></div>'
+          : '<div class="avatar"></div><div style="display:contents"><div class="bubble">' + bubbleContent + '</div><div class="time">' + time + '</div></div>';
       }
       wrap.appendChild(msg);
       wrap.scrollTop = wrap.scrollHeight;
@@ -933,7 +1332,7 @@
 
     async function fetchTodayMood() {
       try {
-        const r = await fetch(`${API_BASE}/api/mood?user_id=${userId}`);
+        const r = await apiFetch('/api/mood');
         if (r.ok) {
           const d = await r.json();
           setMood(d.mood != null && d.mood !== '' ? d.mood : '平静');
@@ -968,15 +1367,14 @@
         if (fileToSend) {
           const form = new FormData();
           form.append('message', text || '');
-          form.append('user_id', String(userId));
           if (sessionId != null) form.append('session_id', String(sessionId));
           form.append('image', fileToSend);
-          r = await fetch(`${API_BASE}/api/chat/send`, { method: 'POST', body: form });
+          r = await apiFetch('/api/chat/send', { method: 'POST', body: form });
         } else {
-          r = await fetch(`${API_BASE}/api/chat`, {
+          r = await apiFetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, session_id: sessionId, message: text }),
+            body: JSON.stringify({ session_id: sessionId, message: text, weather: _weatherSummary || null }),
           });
         }
         let errMsg = '发送失败，请稍后再试';
@@ -986,19 +1384,48 @@
             sessionId = d.session_id;
             loadSessions();
             if (d.mood != null) setMood(d.mood);
-            const replyText = d.reply;
-            const bubble = botBubble.querySelector('.bubble');
-            bubble.innerHTML = escapeHtml(replyText) + ' <button type="button" class="btn-read" title="朗读回复" data-text="' + escapeHtml(replyText) + '">朗读</button><div class="time">' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '</div>';
-            const readBtn = bubble.querySelector('.btn-read');
-            if (readBtn) readBtn.addEventListener('click', () => speakText(readBtn.getAttribute('data-text') || ''));
-            botBubble.classList.remove('typing');
-            if (d.reminder) {
-              const el = document.getElementById('reminderBanner');
-              el.innerHTML = '<strong>树洞对你说：</strong> ' + escapeHtml(d.reminder);
-              el.style.display = 'block';
+            const msgs = (d.messages && d.messages.length > 0) ? d.messages : [d.reply];
+            const wrap = document.getElementById('messages');
+            const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+
+            async function renderBotMessages() {
+              // 第一条替换已有的 typing bubble
+              const firstBubble = botBubble.querySelector('.bubble');
+              firstBubble.innerHTML = escapeHtml(msgs[0]) + ' <button type="button" class="btn-read" data-text="' + escapeHtml(msgs[0]) + '">朗读</button>';
+              firstBubble.querySelector('.btn-read').addEventListener('click', function() { speakText(this.getAttribute('data-text'), this); });
+              const firstTimeEl = document.createElement('div');
+              firstTimeEl.className = 'time';
+              firstTimeEl.textContent = time;
+              botBubble.appendChild(firstTimeEl);
+              botBubble.classList.remove('typing');
+              wrap.scrollTop = wrap.scrollHeight;
+
+              // 后续条目：等待 → 打字动画 → 显示
+              for (let i = 1; i < msgs.length; i++) {
+                await new Promise(r => setTimeout(r, 500 + msgs[i - 1].length * 18));
+                const typingEl = addMessage('bot', '', true);
+                wrap.scrollTop = wrap.scrollHeight;
+                await new Promise(r => setTimeout(r, 700 + msgs[i].length * 22));
+                const bubble = typingEl.querySelector('.bubble');
+                bubble.innerHTML = escapeHtml(msgs[i]) + ' <button type="button" class="btn-read" data-text="' + escapeHtml(msgs[i]) + '">朗读</button>';
+                bubble.querySelector('.btn-read').addEventListener('click', function() { speakText(this.getAttribute('data-text'), this); });
+                const timeEl = document.createElement('div');
+                timeEl.className = 'time';
+                timeEl.textContent = time;
+                typingEl.appendChild(timeEl);
+                typingEl.classList.remove('typing');
+                wrap.scrollTop = wrap.scrollHeight;
+              }
+
+              if (d.anxiety_detected) showBreatheCard(wrap);
+              if (d.reminder) {
+                const el = document.getElementById('reminderBanner');
+                el.innerHTML = '<strong>树洞对你说：</strong> ' + escapeHtml(d.reminder);
+                el.style.display = 'block';
+              }
+              setSendLoading(false);
             }
-            setSendLoading(false);
-            document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+            renderBotMessages();
             return;
           }
           errMsg = (d && (d.detail || d.message)) || errMsg;
@@ -1020,13 +1447,521 @@
       document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
     }
 
-    function speakText(text) {
-      if (!text || !window.speechSynthesis) return;
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = 'zh-CN';
-      window.speechSynthesis.speak(u);
+    // ===== 导出 =====
+    document.getElementById('btnExport').addEventListener('click', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('btnExport');
+      btn.textContent = '导出中…';
+      try {
+        const r = await apiFetch('/api/export/markdown');
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'treeholediary.md';
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (_) {}
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 导出';
+    });
+
+    // ===== 搜索 =====
+    let _searchTimer = null;
+    document.getElementById('diarySearchInput').addEventListener('input', function() {
+      const q = this.value.trim();
+      document.getElementById('btnSearchClear').classList.toggle('show', q.length > 0);
+      clearTimeout(_searchTimer);
+      if (!q) { loadSummaries(); return; }
+      _searchTimer = setTimeout(() => runSearch(q), 350);
+    });
+    document.getElementById('btnSearchClear').addEventListener('click', () => {
+      document.getElementById('diarySearchInput').value = '';
+      document.getElementById('btnSearchClear').classList.remove('show');
+      loadSummaries();
+    });
+
+    async function runSearch(q) {
+      const list = document.getElementById('summariesList');
+      const empty = document.getElementById('summariesEmpty');
+      list.innerHTML = '<p style="color:var(--ink-muted);padding:12px 0;">搜索中…</p>';
+      if (empty) empty.style.display = 'none';
+      try {
+        const r = await apiFetch(`/api/search?q=${encodeURIComponent(q)}`);
+        const arr = await r.json();
+        list.innerHTML = '';
+        if (!arr || arr.length === 0) {
+          list.innerHTML = '<p style="color:var(--ink-muted);padding:12px 0;">没有找到相关记录</p>';
+          return;
+        }
+        arr.forEach(s => {
+          const card = document.createElement('div');
+          card.className = 'summary-card';
+          const date = (s.started_at || '').slice(0, 16).replace('T', ' ');
+          const mood = s.mood || '';
+          const summary = s.summary || '';
+          const highlighted = summary.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), m => `<mark style="background:var(--accent-warm);border-radius:2px;">${m}</mark>`);
+          card.dataset.sessionId = s.session_id;
+          card.dataset.date = (s.started_at || '').slice(0, 10);
+          card.innerHTML = `<div class="card-top"><div class="card-meta"><div class="icon">🔍</div><div><h3>${escapeHtml(date)}</h3></div></div></div><p>${highlighted}</p><div class="card-footer"><span class="detail-link">查看详情 →</span><span class="card-mood">${escapeHtml(mood)}</span></div>`;
+          list.appendChild(card);
+        });
+      } catch (_) {
+        list.innerHTML = '<p style="color:var(--ink-muted);">搜索失败，请稍后再试</p>';
+      }
     }
+
+    // ===== 热力图 =====
+    let _moodCalendarData = {};
+
+    async function loadMoodCalendar(year, month) {
+      try {
+        const r = await apiFetch(`/api/mood/calendar?year=${year}&month=${month}`);
+        _moodCalendarData = await r.json();
+        renderDiaryCalendar();
+      } catch (_) {}
+    }
+
+    // ===== 深色模式 =====
+    (function() {
+      const saved = localStorage.getItem('theme') || 'light';
+      document.documentElement.setAttribute('data-theme', saved);
+      const btn = document.getElementById('btnTheme');
+      if (btn) btn.textContent = saved === 'dark' ? '☀️' : '🌙';
+    })();
+    document.getElementById('btnTheme').addEventListener('click', () => {
+      const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', cur);
+      localStorage.setItem('theme', cur);
+      document.getElementById('btnTheme').textContent = cur === 'dark' ? '☀️' : '🌙';
+    });
+
+    // ===== 移动端侧边栏 =====
+    function isMobile() { return window.innerWidth <= 768; }
+    function openMobileSidebar() {
+      document.getElementById('sidebar').classList.add('mobile-open');
+      document.getElementById('sidebarOverlay').classList.add('show');
+    }
+    function closeMobileSidebar() {
+      document.getElementById('sidebar').classList.remove('mobile-open');
+      document.getElementById('sidebarOverlay').classList.remove('show');
+    }
+    document.getElementById('btnHamburger').addEventListener('click', () => {
+      if (document.getElementById('sidebar').classList.contains('mobile-open')) {
+        closeMobileSidebar();
+      } else {
+        openMobileSidebar();
+      }
+    });
+    document.getElementById('sidebarOverlay').addEventListener('click', closeMobileSidebar);
+
+    // ===== 天气 =====
+    let _weatherSummary = '';
+
+    async function fetchWeather() {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(async (pos) => {
+        try {
+          const { latitude: lat, longitude: lon } = pos.coords;
+          const r = await fetch(`${API_BASE}/api/weather?lat=${lat}&lon=${lon}`);
+          if (!r.ok) return;
+          const d = await r.json();
+          _weatherSummary = d.summary || '';
+          const el = document.getElementById('chatWeather');
+          if (el && _weatherSummary) {
+            el.textContent = _weatherSummary;
+            el.style.display = 'flex';
+          }
+        } catch (_) {}
+      }, () => {}, { timeout: 8000 });
+    }
+
+    // ===== 呼吸练习 =====
+    const BREATHE_MODES = {
+      '478': {
+        phases: [
+          { label: '吸气', seconds: 4, scale: 1.45, color: 'radial-gradient(circle at 40% 35%, #6EE7B7, #10B981)' },
+          { label: '屏住', seconds: 7, scale: 1.45, color: 'radial-gradient(circle at 40% 35%, #FCD34D, #F59E0B)' },
+          { label: '呼气', seconds: 8, scale: 1.0,  color: 'radial-gradient(circle at 40% 35%, #93C5FD, #3B82F6)' },
+        ],
+        tip: '4-7-8 呼吸法：吸气 4 秒 → 屏住 7 秒 → 呼气 8 秒，有效缓解即时焦虑',
+      },
+      'box': {
+        phases: [
+          { label: '吸气', seconds: 4, scale: 1.45, color: 'radial-gradient(circle at 40% 35%, #6EE7B7, #10B981)' },
+          { label: '屏住', seconds: 4, scale: 1.45, color: 'radial-gradient(circle at 40% 35%, #FCD34D, #F59E0B)' },
+          { label: '呼气', seconds: 4, scale: 1.0,  color: 'radial-gradient(circle at 40% 35%, #93C5FD, #3B82F6)' },
+          { label: '屏住', seconds: 4, scale: 1.0,  color: 'radial-gradient(circle at 40% 35%, #C4B5FD, #8B5CF6)' },
+        ],
+        tip: '方形呼吸：吸气 → 屏住 → 呼气 → 屏住，各 4 秒，帮助平稳专注',
+      },
+    };
+
+    // 音效：Web Audio API 合成钟声
+    let _breatheAudioCtx = null;
+    let _breatheAudioOn = true;
+
+    function _ensureAudioCtx() {
+      if (!_breatheAudioCtx) {
+        _breatheAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (_breatheAudioCtx.state === 'suspended') _breatheAudioCtx.resume();
+    }
+
+    // 合成一个衰减钟声：主频 + 八度谐波，模拟铜钵音色
+    function _playBell(freq, vol = 0.28, duration = 1.8) {
+      if (!_breatheAudioOn) return;
+      try {
+        _ensureAudioCtx();
+        const ctx = _breatheAudioCtx;
+        [[freq, vol], [freq * 2, vol * 0.35], [freq * 3.01, vol * 0.12]].forEach(([f, v]) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(f, ctx.currentTime);
+          gain.gain.setValueAtTime(0, ctx.currentTime);
+          gain.gain.linearRampToValueAtTime(v, ctx.currentTime + 0.015);
+          gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+          osc.start(ctx.currentTime);
+          osc.stop(ctx.currentTime + duration + 0.05);
+        });
+      } catch(_) {}
+    }
+
+    // 各阶段对应的钟声频率
+    const _BELL_FREQ = { '吸气': 396, '屏住': 528, '呼气': 264 };
+
+    function _playPhaseSound(label) {
+      _playBell(_BELL_FREQ[label] || 396);
+    }
+
+    document.getElementById('breatheMute').addEventListener('click', () => {
+      _breatheAudioOn = !_breatheAudioOn;
+      document.getElementById('breatheMute').textContent = _breatheAudioOn ? '🔔' : '🔕';
+    });
+
+    let _breatheMode = '478';
+    let _breatheRunning = false;
+    let _breatheTimer = null;
+    let _breathePhaseIdx = 0;
+    let _breatheSecondsLeft = 0;
+    let _breatheCycles = 0;
+
+    function _breatheApplyPhase(phase, withSound = true) {
+      const ring = document.getElementById('breatheRing');
+      const label = document.getElementById('breathePhaseLabel');
+      ring.style.background = phase.color;
+      ring.style.transition = `transform ${phase.seconds}s ease-in-out, background 0.6s ease`;
+      ring.style.transform = `scale(${phase.scale})`;
+      label.textContent = phase.label;
+      if (withSound) _playPhaseSound(phase.label);
+    }
+
+    function _breatheTick() {
+      const mode = BREATHE_MODES[_breatheMode];
+      const phase = mode.phases[_breathePhaseIdx];
+      document.getElementById('breatheCountText').textContent = _breatheSecondsLeft;
+
+      if (_breatheSecondsLeft <= 0) {
+        _breathePhaseIdx = (_breathePhaseIdx + 1) % mode.phases.length;
+        if (_breathePhaseIdx === 0) {
+          _breatheCycles++;
+          document.getElementById('breatheCycles').textContent = `第 ${_breatheCycles} 轮`;
+        }
+        const next = mode.phases[_breathePhaseIdx];
+        _breatheApplyPhase(next);
+        _breatheSecondsLeft = next.seconds;
+      } else {
+        _breatheSecondsLeft--;
+      }
+    }
+
+    function _breatheStart() {
+      _ensureAudioCtx();
+      const mode = BREATHE_MODES[_breatheMode];
+      _breathePhaseIdx = 0;
+      _breatheCycles = 0;
+      _breatheSecondsLeft = mode.phases[0].seconds;
+      _breatheApplyPhase(mode.phases[0], true);
+      document.getElementById('breatheCycles').textContent = '第 0 轮';
+      document.getElementById('breatheCountText').textContent = _breatheSecondsLeft;
+      document.getElementById('breatheToggle').textContent = '停止';
+      _breatheRunning = true;
+      _breatheTimer = setInterval(_breatheTick, 1000);
+    }
+
+    function _breatheStop() {
+      clearInterval(_breatheTimer);
+      _breatheTimer = null;
+      _breatheRunning = false;
+      const ring = document.getElementById('breatheRing');
+      ring.style.transition = 'transform 1s ease, background 0.6s ease';
+      ring.style.transform = 'scale(1)';
+      ring.style.background = 'radial-gradient(circle at 40% 35%, #93C5FD, #3B82F6)';
+      document.getElementById('breathePhaseLabel').textContent = '准备好了吗';
+      document.getElementById('breatheCountText').textContent = '';
+      document.getElementById('breatheToggle').textContent = '开始';
+    }
+
+    function openBreathe() {
+      document.getElementById('breatheOverlay').classList.add('show');
+    }
+    function closeBreathe() {
+      _breatheStop();
+      document.getElementById('breatheOverlay').classList.remove('show');
+    }
+
+    document.getElementById('breatheClose').addEventListener('click', closeBreathe);
+    document.getElementById('breatheToggle').addEventListener('click', () => {
+      if (_breatheRunning) { _breatheStop(); } else { _breatheStart(); }
+    });
+    document.querySelectorAll('.breathe-mode-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        if (_breatheRunning) _breatheStop();
+        _breatheMode = tab.getAttribute('data-mode');
+        document.querySelectorAll('.breathe-mode-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('breatheTip').textContent = BREATHE_MODES[_breatheMode].tip;
+      });
+    });
+
+    function showBreatheCard(msgWrap) {
+      const card = document.createElement('div');
+      card.className = 'breathe-card';
+      card.innerHTML = `<div class="breathe-card-icon">🫁</div><div class="breathe-card-body"><p>我注意到你最近压力有点大，要不要试试呼吸练习？只需要几分钟，能帮你平静下来。</p><button class="btn-breathe-start">开始呼吸练习</button></div>`;
+      card.querySelector('.btn-breathe-start').addEventListener('click', openBreathe);
+      msgWrap.appendChild(card);
+      msgWrap.scrollTop = msgWrap.scrollHeight;
+    }
+
+    let _currentAudio = null;
+
+    function cleanForTTS(text) {
+      return text
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/\*(.+?)\*/g, '$1')
+        .replace(/#+\s*/g, '')
+        .replace(/[-•]\s+/g, '')
+        .replace(/\n{2,}/g, '。')
+        .replace(/\n/g, '，')
+        .trim();
+    }
+
+    async function speakText(text, btn) {
+      if (_currentAudio && !_currentAudio.paused) {
+        _currentAudio.pause();
+        _currentAudio = null;
+        if (btn) { btn.textContent = '朗读'; }
+        return;
+      }
+      if (!text) return;
+      if (btn) { btn.textContent = '…'; btn.disabled = true; }
+      try {
+        const r = await fetch(`${API_BASE}/api/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: cleanForTTS(text) }),
+        });
+        if (!r.ok) throw new Error('TTS 请求失败');
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        _currentAudio = new Audio(url);
+        _currentAudio.onended = () => {
+          if (btn) btn.textContent = '朗读';
+          URL.revokeObjectURL(url);
+        };
+        _currentAudio.play();
+        if (btn) { btn.textContent = '停止'; btn.disabled = false; }
+      } catch (e) {
+        if (btn) { btn.textContent = '朗读'; btn.disabled = false; }
+      }
+    }
+
+    // ---- Auth ----
+    function switchAuthTab(tab) {
+      document.getElementById('loginForm').style.display = tab === 'login' ? '' : 'none';
+      document.getElementById('registerForm').style.display = tab === 'register' ? '' : 'none';
+      document.getElementById('tabLogin').classList.toggle('active', tab === 'login');
+      document.getElementById('tabRegister').classList.toggle('active', tab === 'register');
+      document.getElementById('authError').textContent = '';
+    }
+
+    function showAuthError(msg) {
+      document.getElementById('authError').textContent = msg || '出错了，请稍后再试';
+    }
+
+    // Bearer token 存 localStorage
+    function getToken() { return localStorage.getItem('xb_token') || ''; }
+    function setToken(t) { if (t) localStorage.setItem('xb_token', t); else localStorage.removeItem('xb_token'); }
+    function authHeaders(extra) {
+      const t = getToken();
+      const h = Object.assign({}, extra || {});
+      if (t) h['Authorization'] = 'Bearer ' + t;
+      return h;
+    }
+    function apiFetch(url, opts) {
+      opts = opts || {};
+      const h = authHeaders(opts.headers || {});
+      return fetch(API_BASE + url, Object.assign({}, opts, { headers: h }));
+    }
+
+    function onAuthSuccess(data) {
+      userId = data.user_id;
+      if (data.token) setToken(data.token);
+      document.getElementById('authOverlay').classList.add('hidden');
+      const nameEl = document.getElementById('navUserName');
+      if (nameEl) nameEl.textContent = data.name || data.email || '';
+      const settingsBtn = document.getElementById('btnSettings');
+      if (settingsBtn) settingsBtn.style.display = '';
+      const logoutBtn = document.getElementById('btnLogout');
+      if (logoutBtn) logoutBtn.style.display = '';
+      // 登录后加载数据
+      setChatDate();
+      checkIn();
+      fetchTodayMood();
+      fetchWeather();
+      loadSessions().then(sessions => {
+        if (sessions && sessions.length > 0) {
+          sessionId = sessions[0].session_id;
+          loadSessionMessages(sessionId).then(() => {
+            document.querySelectorAll('.session-row').forEach(el => {
+              el.classList.toggle('active', parseInt(el.getAttribute('data-sid'), 10) === sessionId);
+            });
+          });
+        }
+      });
+    }
+
+    async function doLogin() {
+      const email = document.getElementById('loginEmail').value.trim();
+      const password = document.getElementById('loginPassword').value;
+      if (!email || !password) { showAuthError('请填写邮箱和密码'); return; }
+      try {
+        const r = await fetch(`${API_BASE}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await r.json();
+        if (!r.ok) { showAuthError(data.detail || '登录失败'); return; }
+        onAuthSuccess(data);
+      } catch (e) { showAuthError('服务器连接失败，请确认服务已启动'); }
+    }
+
+    async function doRegister() {
+      const email = document.getElementById('regEmail').value.trim();
+      const name = document.getElementById('regName').value.trim();
+      const password = document.getElementById('regPassword').value;
+      if (!email || !password) { showAuthError('请填写邮箱和密码'); return; }
+      if (password.length < 6) { showAuthError('密码至少 6 位'); return; }
+      try {
+        const r = await fetch(`${API_BASE}/api/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, name, password }),
+        });
+        const data = await r.json();
+        if (!r.ok) { showAuthError(data.detail || '注册失败'); return; }
+        onAuthSuccess(data);
+      } catch (e) { showAuthError('服务器连接失败，请确认服务已启动'); }
+    }
+
+    async function doLogout() {
+      apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      setToken('');
+      userId = null;
+      sessionId = null;
+      document.getElementById('authOverlay').classList.remove('hidden');
+      document.getElementById('navUserName').textContent = '';
+      document.getElementById('btnLogout').style.display = 'none';
+      document.getElementById('messages').innerHTML = '';
+      document.getElementById('sessions').innerHTML = '';
+    }
+
+    async function checkAuthAndInit() {
+      const token = getToken();
+      if (!token) { document.getElementById('authOverlay').classList.remove('hidden'); return; }
+      try {
+        const r = await apiFetch('/api/auth/me');
+        if (r.ok) {
+          const data = await r.json();
+          onAuthSuccess(data);
+        } else {
+          setToken('');
+          document.getElementById('authOverlay').classList.remove('hidden');
+        }
+      } catch (e) {
+        document.getElementById('authOverlay').classList.remove('hidden');
+      }
+    }
+
+    // ---- Settings ----
+    function openSettings() {
+      ['cpCurrent','cpNew','cpConfirm','delPassword'].forEach(id => { const el = document.getElementById(id); if(el) el.value=''; });
+      ['cpError','delError'].forEach(id => { const el = document.getElementById(id); if(el) el.textContent=''; });
+      document.getElementById('settingsOverlay').classList.remove('hidden');
+    }
+    function closeSettings() {
+      document.getElementById('settingsOverlay').classList.add('hidden');
+    }
+
+    async function doChangePassword() {
+      const cur = document.getElementById('cpCurrent').value;
+      const nw = document.getElementById('cpNew').value;
+      const cf = document.getElementById('cpConfirm').value;
+      const errEl = document.getElementById('cpError');
+      errEl.textContent = '';
+      if (!cur || !nw || !cf) { errEl.textContent = '请填写所有密码字段'; return; }
+      if (nw.length < 6) { errEl.textContent = '新密码至少 6 位'; return; }
+      if (nw !== cf) { errEl.textContent = '两次输入的新密码不一致'; return; }
+      try {
+        const r = await apiFetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current_password: cur, new_password: nw }),
+        });
+        const data = await r.json();
+        if (!r.ok) { errEl.textContent = data.detail || '修改失败'; return; }
+        errEl.style.color = '#16a34a';
+        errEl.textContent = '密码已更新';
+        setTimeout(() => { errEl.style.color = ''; errEl.textContent = ''; }, 2000);
+        document.getElementById('cpCurrent').value = '';
+        document.getElementById('cpNew').value = '';
+        document.getElementById('cpConfirm').value = '';
+      } catch(e) { errEl.textContent = '服务器连接失败'; }
+    }
+
+    async function doDeleteAccount() {
+      const pwd = document.getElementById('delPassword').value;
+      const errEl = document.getElementById('delError');
+      errEl.textContent = '';
+      if (!pwd) { errEl.textContent = '请输入密码确认注销'; return; }
+      if (!confirm('确定要永久注销账号吗？所有数据将被删除，无法恢复。')) return;
+      try {
+        const r = await apiFetch('/api/auth/account', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pwd }),
+        });
+        const data = await r.json();
+        if (!r.ok) { errEl.textContent = data.detail || '注销失败'; return; }
+        setToken('');
+        userId = null;
+        sessionId = null;
+        closeSettings();
+        document.getElementById('authOverlay').classList.remove('hidden');
+        document.getElementById('navUserName').textContent = '';
+        document.getElementById('btnLogout').style.display = 'none';
+        document.getElementById('btnSettings').style.display = 'none';
+        document.getElementById('messages').innerHTML = '';
+        document.getElementById('sessions').innerHTML = '';
+      } catch(e) { errEl.textContent = '服务器连接失败'; }
+    }
+
+    // Enter 快捷键提交 auth 表单
+    document.getElementById('loginPassword').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    document.getElementById('regPassword').addEventListener('keydown', e => { if (e.key === 'Enter') doRegister(); });
 
     (function initVoiceInput() {
       const micBtn = document.getElementById('micBtn');
@@ -1093,7 +2028,11 @@
         const dateStr = calYear + '-' + String(calMonth + 1).padStart(2, '0') + '-' + String(d).padStart(2, '0');
         el.className = 'cal-day';
         if (dateStr === todayStr) el.classList.add('today');
-        if (diaryDatesSet.has(dateStr)) el.classList.add('has-entry');
+        if (diaryDatesSet.has(dateStr)) {
+          el.classList.add('has-entry');
+          const moodInfo = _moodCalendarData[dateStr];
+          if (moodInfo) el.classList.add('mood-' + moodInfo.category);
+        }
         el.textContent = d;
         el.dataset.date = dateStr;
         el.addEventListener('click', function() {
@@ -1120,12 +2059,12 @@
     document.getElementById('calPrev').addEventListener('click', () => {
       calMonth -= 1;
       if (calMonth < 0) { calMonth = 11; calYear -= 1; }
-      renderDiaryCalendar();
+      loadMoodCalendar(calYear, calMonth + 1);
     });
     document.getElementById('calNext').addEventListener('click', () => {
       calMonth += 1;
       if (calMonth > 11) { calMonth = 0; calYear += 1; }
-      renderDiaryCalendar();
+      loadMoodCalendar(calYear, calMonth + 1);
     });
 
     async function loadSummaries() {
@@ -1135,7 +2074,7 @@
       list.innerHTML = '';
       diaryDatesSet = new Set();
       try {
-        const r = await fetch(`${API_BASE}/api/summaries?user_id=${userId}`);
+        const r = await apiFetch('/api/summaries');
         const arr = await r.json();
         if (!arr || arr.length === 0) {
           if (empty) empty.style.display = 'block';
@@ -1164,7 +2103,7 @@
           card.innerHTML = `<div class="card-top"><div class="card-meta"><div class="icon">📅</div><div><h3>${escapeHtml(date)}</h3><span class="count">共 ${(s.summary || '').length > 0 ? '1' : '0'} 条记录</span></div></div></div><p>${escapeHtml(s.summary || '')}</p>${imagesHtml}${s.anxiety_detected ? '<span class="tag">本次对话有焦虑/压力相关</span>' : ''}<div class="card-footer"><span class="detail-link">查看详情 →</span>${moodHtml}</div>`;
           list.appendChild(card);
         });
-        renderDiaryCalendar();
+        loadMoodCalendar(calYear, calMonth + 1);
       } catch (_) {
         if (empty) { empty.textContent = '加载失败，请稍后再试'; empty.style.display = 'block'; }
         renderDiaryCalendar();
@@ -1188,7 +2127,7 @@
       bodyEl.innerHTML = '<p style="color:var(--ink-light);">加载中…</p>';
       overlay.classList.add('show');
       try {
-        const r = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages?user_id=${userId}`);
+        const r = await apiFetch(`/api/sessions/${sessionId}/messages`);
         const data = await r.json();
         const messages = data.messages || data || [];
         if (messages.length === 0) {
@@ -1223,26 +2162,158 @@
     async function endSessionAndSummarize() {
       if (!sessionId) return;
       try {
-        await fetch(`${API_BASE}/api/session/end`, {
+        await apiFetch('/api/session/end', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ user_id: userId, session_id: sessionId }),
+          body: JSON.stringify({ session_id: sessionId }),
         });
       } catch (_) {}
     }
 
-    window.addEventListener('load', async () => {
-      setChatDate();
-      checkIn();
-      fetchTodayMood();
-      const sessions = await loadSessions();
-      if (sessions && sessions.length > 0) {
-        sessionId = sessions[0].session_id;
-        await loadSessionMessages(sessionId);
-        document.querySelectorAll('.session-row').forEach(el => {
-          el.classList.toggle('active', parseInt(el.getAttribute('data-sid'), 10) === sessionId);
-        });
+    // ===== 情绪周报 =====
+    let reportWeekOffset = 0;
+
+    function renderMoodSvg(curve) {
+      const W = 580, H = 180, PAD_L = 36, PAD_R = 20, PAD_T = 28, PAD_B = 40;
+      const days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+      const chartW = W - PAD_L - PAD_R;
+      const chartH = H - PAD_T - PAD_B;
+      const baseY = PAD_T + chartH;
+
+      const points = curve.map((d, i) => {
+        const x = PAD_L + (i / 6) * chartW;
+        const score = d.score != null ? d.score : null;
+        const y = score != null ? PAD_T + chartH - ((score - 1) / 9) * chartH : null;
+        return { x, y, d };
+      });
+
+      // Build connected segments
+      const lineSegs = [];
+      let seg = [];
+      for (const p of points) {
+        if (p.y != null) { seg.push(p); }
+        else { if (seg.length > 1) lineSegs.push(seg); seg = []; }
       }
+      if (seg.length > 1) lineSegs.push(seg);
+
+      const colorMap = { positive: '#34D399', negative: '#FBBF24', neutral: '#94a3b8' };
+      const uid = 'grad' + Date.now();
+
+      let svg = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="font-family:'Noto Sans SC',sans-serif;">`;
+
+      // Gradient def
+      svg += `<defs><linearGradient id="${uid}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#C4A97D" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#C4A97D" stop-opacity="0.0"/>
+      </linearGradient></defs>`;
+
+      // Score labels left
+      for (const [label, score] of [['高', 10], ['中', 5], ['低', 1]]) {
+        const gy = PAD_T + chartH - ((score - 1) / 9) * chartH;
+        svg += `<text x="${PAD_L - 8}" y="${gy + 4}" text-anchor="end" font-size="10" fill="#c4b89a">${label}</text>`;
+        svg += `<line x1="${PAD_L}" y1="${gy}" x2="${W - PAD_R}" y2="${gy}" stroke="#EDE9E3" stroke-width="1" stroke-dasharray="4 3"/>`;
+      }
+
+      // Gradient fill areas
+      for (const seg of lineSegs) {
+        const pts = seg.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+        const first = seg[0], last = seg[seg.length - 1];
+        const fillPath = `M${first.x.toFixed(1)},${baseY} ` + seg.map(p => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ` L${last.x.toFixed(1)},${baseY} Z`;
+        svg += `<path d="${fillPath}" fill="url(#${uid})"/>`;
+        svg += `<polyline points="${pts}" fill="none" stroke="#C4A97D" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`;
+      }
+
+      // Dots + mood labels
+      for (const p of points) {
+        if (p.y == null) continue;
+        const cat = p.d.category || 'neutral';
+        const color = colorMap[cat] || '#94a3b8';
+        svg += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="5.5" fill="${color}" stroke="white" stroke-width="2"/>`;
+        if (p.d.mood) {
+          const labelY = Math.max(PAD_T + 11, p.y - 11);
+          svg += `<text x="${p.x.toFixed(1)}" y="${labelY}" text-anchor="middle" font-size="10" fill="#8a7a65" font-weight="500">${escapeHtml(p.d.mood)}</text>`;
+        }
+      }
+
+      // X-axis labels
+      for (let i = 0; i < 7; i++) {
+        const x = PAD_L + (i / 6) * chartW;
+        const hasData = curve[i] && curve[i].score != null;
+        svg += `<text x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle" font-size="11" fill="${hasData ? '#8a7a65' : '#c4b89a'}">${days[i]}</text>`;
+      }
+
+      svg += '</svg>';
+      return svg;
+    }
+
+    async function loadWeeklyReport() {
+      const loading = document.getElementById('reportLoading');
+      const content = document.getElementById('reportContent');
+      loading.style.display = 'block';
+      content.style.display = 'none';
+
+      try {
+        const r = await apiFetch(`/api/report/weekly?week_offset=${reportWeekOffset}`);
+        const data = await r.json();
+
+        // Week label
+        const start = data.period.start.replace(/-/g, '/');
+        const end = data.period.end.replace(/-/g, '/');
+        document.getElementById('reportWeekLabel').textContent = `${start} – ${end}`;
+
+        // Stats
+        const statsEl = document.getElementById('reportStats');
+        const st = data.stats;
+        statsEl.innerHTML = `
+          <div class="stat-card sc-green"><div class="stat-icon">🌱</div><div class="stat-val">${st.active_days}</div><div class="stat-label">活跃天数</div></div>
+          <div class="stat-card sc-yellow"><div class="stat-icon">✨</div><div class="stat-val">${st.avg_score}</div><div class="stat-label">平均情绪分</div></div>
+          <div class="stat-card sc-blue"><div class="stat-icon">🌊</div><div class="stat-val">${st.anxiety_days}</div><div class="stat-label">焦虑天数</div></div>
+          <div class="stat-card sc-purple"><div class="stat-icon">💭</div><div class="stat-val">${escapeHtml(st.dominant_mood)}</div><div class="stat-label">主要情绪</div></div>
+        `;
+
+        // Mood chart
+        document.getElementById('reportMoodChart').innerHTML = renderMoodSvg(data.mood_curve);
+
+        // Keywords
+        const kwEl = document.getElementById('reportKeywords');
+        const kwColors = ['kw-a', 'kw-b', 'kw-c', 'kw-d', 'kw-e'];
+        if (data.keywords && data.keywords.length > 0) {
+          const maxW = data.keywords[0].weight || 1;
+          kwEl.innerHTML = data.keywords.map((kw, i) => {
+            const size = 0.78 + (kw.weight / maxW) * 0.65;
+            const cls = kwColors[i % kwColors.length];
+            return `<span class="kw-tag ${cls}" style="font-size:${size.toFixed(2)}rem;">${escapeHtml(kw.word)}</span>`;
+          }).join('');
+        } else {
+          kwEl.innerHTML = '<span style="color:var(--ink-muted);font-size:0.9rem;">暂无数据</span>';
+        }
+
+        // Highlights & suggestions
+        document.getElementById('reportHighlights').textContent = data.highlights || '本周数据不足，多和树洞说说话吧～';
+        document.getElementById('reportSuggestions').textContent = data.suggestions || '坚持每天记录，情绪的积累会让你更了解自己。';
+
+        loading.style.display = 'none';
+        content.style.display = 'block';
+
+        // Disable next button if at current week
+        document.getElementById('reportNext').disabled = reportWeekOffset >= 0;
+      } catch (e) {
+        loading.textContent = '加载失败，请稍后再试。';
+      }
+    }
+
+    document.getElementById('reportPrev').addEventListener('click', () => {
+      reportWeekOffset -= 1;
+      loadWeeklyReport();
+    });
+    document.getElementById('reportNext').addEventListener('click', () => {
+      if (reportWeekOffset >= 0) return;
+      reportWeekOffset += 1;
+      loadWeeklyReport();
+    });
+
+    window.addEventListener('load', () => {
+      checkAuthAndInit();
     });
     window.addEventListener('beforeunload', () => endSessionAndSummarize());
   </script>

@@ -18,12 +18,24 @@ async def init_db():
     conn = await get_db()
     try:
         await conn.executescript("""
-        -- 用户（简化：单用户也可用，多用户用 user_id 区分）
+        -- 用户（支持多用户：email+密码注册登录）
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
+            email TEXT UNIQUE,
+            password_hash TEXT,
             last_login_at TEXT,
             created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- 登录 Token（30 天有效期，httponly cookie 传递）
+        CREATE TABLE IF NOT EXISTS user_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
         );
 
         -- 会话（每次打开对话可视为一个会话，用于生成总结）
@@ -67,6 +79,17 @@ async def init_db():
         );
         """)
         await conn.commit()
+        # 为旧库补充 auth 列
+        for sql in [
+            "ALTER TABLE users ADD COLUMN email TEXT",
+            "ALTER TABLE users ADD COLUMN password_hash TEXT",
+        ]:
+            try:
+                await conn.execute(sql)
+                await conn.commit()
+            except Exception:
+                pass
+
         # 为旧库补充 embedding 列（语义检索用）
         try:
             await conn.execute("ALTER TABLE knowledge ADD COLUMN embedding TEXT")

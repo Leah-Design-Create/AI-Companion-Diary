@@ -2,29 +2,36 @@
 """情感陪伴 AI - 主入口：FastAPI + 聊天 / 总结 / RAG / 久未登录提醒"""
 import base64
 import json
+import re
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+import secrets
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Cookie, Depends, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+import bcrypt as _bcrypt
 from pydantic import BaseModel
 
-from config import OPENAI_API_KEY
+from config import OPENAI_API_KEY, MAX_KNOWLEDGE_UPLOAD_BYTES, MAX_KNOWLEDGE_TEXT_CHARS, DB_PATH
 from db import init_db, get_db, ensure_user
 from prompts import COMPANION_SYSTEM, build_chat_context
-from services.llm import chat, chat_stream
+from services.llm import chat, chat_stream, chat_with_knowledge, chat_stream_with_knowledge
 from services.anxiety import analyze_anxiety
 from services.mood import analyze_mood
 from services.embedding import get_embedding
 from services.rag import get_relevant_context, _extract_keywords
-from services.intent import detect_intent
 from services.summary import generate_summary
 from services.reminder import get_reminder_if_inactive
 from services.tts import synthesize_to_mp3
+from services.long_memory import add_turn_to_memory, retrieve_relevant_memories, extract_and_save_profiles
+from services.report import get_weekly_report
+from services.weather import get_weather
 
 # RAG 调用统计（总次数、命中次数），用于看命中率
 RAG_STATS = {"total": 0, "hits": 0}
@@ -54,6 +61,13 @@ def _image_path_to_content_parts(text: str, image_path: Optional[str], upload_di
 # 明显是「接着上一句说」的短回复，不触发 RAG，避免误注入无关参考、打断对话
 _FOLLOW_UP_PHRASES = ("详细说说", "然后呢", "继续", "还有呢", "怎么说", "再讲讲", "具体点", "还有吗", "嗯嗯", "好的", "哦")
 
+# 含这些词时强制调用知识库（模型可能自认为知道答案而跳过搜索）
+_KNOWLEDGE_KEYWORDS = frozenset({
+    "焦虑", "情绪", "心理", "压力", "恐惧", "抑郁", "紧张", "症状", "治疗",
+    "缓解", "性格", "恐慌", "焦虑症", "心理健康", "认知", "行为", "神经",
+    "杏仁核", "皮质醇", "应激", "创伤", "惊恐", "强迫", "社交恐惧",
+})
+
 
 def _is_rag_skip_follow_up(msg: str) -> bool:
     """True 表示本条不查 RAG，只按对话历史继续聊（避免「详细说说」误命中知识库而答成别的）。"""
@@ -65,27 +79,129 @@ def _is_rag_skip_follow_up(msg: str) -> bool:
     return False
 
 
-# 知识库相关词：用户消息含这些才认为在「问参考」，否则检索到也不注入，让模型用自身知识答（如美国总统、马斯克）
-_KB_TOPIC_HINTS = ("焦虑", "情绪", "压力", "心理", "书中", "参考", "文档", "自救", "缓解", "症状", "恐惧", "障碍")
+def _should_inject_rag_by_score(mode: str, score: float) -> bool:
+    """根据检索相关度分数决定是否注入 RAG 内容。
+    语义模式：余弦相似度 >= 0.45 视为相关；关键词模式：命中关键词数 >= 1 即注入。
+    """
+    if mode == "semantic":
+        return score >= 0.45
+    else:  # keyword
+        return score >= 1
 
 
-def _should_inject_rag(user_message: str, rag_texts: list[str], keywords: list[str]) -> bool:
-    """检索到了也未必注入：只有用户明显在问知识库相关，或检索内容与用户问题有关时才注入。"""
-    if not rag_texts:
-        return False
-    msg = (user_message or "").strip()
-    # 用户明确在问书/参考/焦虑等，注入
-    if any(h in msg for h in _KB_TOPIC_HINTS):
-        return True
-    # 至少有一个「实词」关键词出现在检索结果里，才认为相关（避免「想知道」「是谁」命中无关文档）
-    combined = " ".join(rag_texts)
-    stop = {"想", "知道", "是", "的", "你", "我", "有", "吗", "什么", "怎么", "如何", "哪些", "告诉", "认识", "谁"}
-    for kw in keywords:
-        if not kw or len(kw) < 2 or kw in stop:
-            continue
-        if kw in combined:
-            return True
-    return False
+def _chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
+    """将长文本切成若干 chunk，优先在段落/句子边界分割，相邻 chunk 有 overlap 字重叠。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        is_last = end >= len(text)
+        # 优先在段落或句尾分割，避免截断句子中间
+        if not is_last:
+            for sep in ("\n\n", "\n", "。", "！", "？", ".", "!", "?"):
+                pos = text.rfind(sep, start + chunk_size // 2, end)
+                if pos > start:
+                    end = pos + len(sep)
+                    break
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if is_last:
+            break
+        start = end - overlap
+    return chunks
+
+
+def _read_upload_bytes_limited(file: UploadFile) -> bytes:
+    """按字节上限分块读取上传体，避免一次性 read() 撑爆内存。"""
+    max_b = MAX_KNOWLEDGE_UPLOAD_BYTES
+    buf = bytearray()
+    step = 1024 * 1024
+    while True:
+        piece = file.file.read(step)
+        if not piece:
+            break
+        if len(buf) + len(piece) > max_b:
+            mb = max_b // (1024 * 1024)
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件过大（超过 {mb} MB）。请拆成多个较小的文件上传，或在 .env 中增大 MAX_KNOWLEDGE_UPLOAD_BYTES。",
+            )
+        buf.extend(piece)
+    return bytes(buf)
+
+
+def _enforce_knowledge_text_limit(text: str) -> None:
+    cap = MAX_KNOWLEDGE_TEXT_CHARS
+    n = len(text or "")
+    if n > cap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"正文过长（{n} 字，上限 {cap}）。请拆成多个文件，或在 .env 中增大 MAX_KNOWLEDGE_TEXT_CHARS。",
+        )
+
+
+_MEMORY_RECALL_HINTS = ("记得", "还记得", "上次", "之前", "我说过", "我提过", "你知道我", "你还记得")
+
+
+def _is_memory_recall_query(msg: str) -> bool:
+    s = (msg or "").strip()
+    return bool(s) and any(h in s for h in _MEMORY_RECALL_HINTS)
+
+
+# ---------- Auth 依赖 ----------
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> int:
+    """FastAPI 依赖：从 Authorization: Bearer <token> 读取 token，返回 user_id；未登录则 401。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录，请先注册或登录")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录，请先注册或登录")
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT user_id, expires_at FROM user_tokens WHERE token = ?", (token,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+        if row["expires_at"] < datetime.now().isoformat():
+            raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+        return row["user_id"]
+    finally:
+        await conn.close()
+
+
+async def _create_token(user_id: int) -> str:
+    """生成 64 位随机 token，写入 user_tokens 表，30 天有效。"""
+    token = secrets.token_hex(32)
+    expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+    conn = await get_db()
+    try:
+        await conn.execute(
+            "INSERT INTO user_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
+            (user_id, token, expires_at),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+    return token
 
 
 # ---------- 请求体 ----------
@@ -93,6 +209,7 @@ class ChatRequest(BaseModel):
     user_id: int = 1
     session_id: int | None = None  # 不传则新建会话
     message: str
+    weather: str | None = None  # 天气摘要，如 "☀️ 北京，晴，28°C"
 
 
 class EndSessionRequest(BaseModel):
@@ -248,45 +365,89 @@ async def upload_page():
 async def api_tts(req: TTSRequest):
     """文本转语音：调用 DashScope qwen3-tts-flash，返回 mp3 音频。"""
     audio_bytes = await synthesize_to_mp3(req.text)
-    return Response(content=audio_bytes, media_type="audio/mpeg")
+    return Response(content=audio_bytes, media_type="audio/wav")
 
 
 # ---------- 对话 ----------
-async def _get_today_mood(conn, user_id: int) -> str:
-    """按当天该用户所有会话的对话综合计算心情，以天为单位。"""
-    mood_messages = []
+async def _get_current_mood(conn, session_id: int) -> str:
+    """读取当前 session 上一轮写入的情绪（后台任务写入），无则返回平静。"""
+    try:
+        cursor = await conn.execute("SELECT mood FROM sessions WHERE id = ?", (session_id,))
+        row = await cursor.fetchone()
+        return (row["mood"] or "平静") if row else "平静"
+    except Exception:
+        return "平静"
+
+
+def _split_reply(text: str) -> list[str]:
+    """将 AI 回复拆分成 2-3 条短消息，模拟朋友连发的对话感。
+    优先使用模型输出的 [NEXT] 分隔符，否则按句末标点自动分句合并。
+    """
+    # 模型主动分条
+    if "[NEXT]" in text:
+        parts = [p.strip() for p in text.split("[NEXT]") if p.strip()]
+        if len(parts) > 1:
+            return parts[:3]
+
+    # 自动按句末标点分句
+    raw = re.split(r'(?<=[。！？…~～\n])', text)
+    sentences = [s.strip() for s in raw if s.strip()]
+    if len(sentences) <= 1:
+        return [text.strip()]
+
+    # 合并成 2-3 块，每块 ≤55 字
+    chunks: list[str] = []
+    current = ""
+    for s in sentences:
+        if current and len(current) + len(s) > 55:
+            chunks.append(current)
+            current = s
+        else:
+            current += s
+    if current:
+        chunks.append(current)
+
+    # 超过 3 条时把末尾合并，少于 2 条不拆
+    if len(chunks) > 3:
+        chunks = chunks[:2] + ["".join(chunks[2:])]
+    if len(chunks) < 2:
+        return [text.strip()]
+    return chunks
+
+
+_FOLLOWUP_KEYWORDS = ["准备", "打算", "计划", "在找", "在等", "想试", "想去", "想学", "要去", "正在", "面试", "申请", "等结果", "等消息"]
+
+
+async def _get_followup_hint(user_id: int, conn) -> str:
+    """查询 2-14 天前未跟进的话题，返回主动关怀提示（无则返回空字符串）。"""
+    from datetime import date, timedelta
+    today = date.today()
+    date_from = (today - timedelta(days=14)).isoformat()
+    date_to = (today - timedelta(days=2)).isoformat()
     try:
         cursor = await conn.execute(
-            """SELECT m.role, m.content FROM messages m
-               JOIN sessions s ON s.id = m.session_id
-               WHERE s.user_id = ? AND date(m.created_at) = date('now', 'localtime')
-               ORDER BY m.id ASC""",
-            (user_id,),
+            """SELECT summary FROM sessions
+               WHERE user_id = ?
+                 AND summary IS NOT NULL AND summary != ''
+                 AND date(started_at) BETWEEN ? AND ?
+               ORDER BY started_at DESC LIMIT 5""",
+            (user_id, date_from, date_to),
         )
         rows = await cursor.fetchall()
-        mood_messages = [{"role": r["role"], "content": (r["content"] or "")} for r in rows]
+        for row in rows:
+            summary = row["summary"] or ""
+            if any(kw in summary for kw in _FOLLOWUP_KEYWORDS):
+                # 取第一个匹配的摘要
+                return (
+                    f"用户上次（2-14天前）曾提到以下事项，你可以在对话中找自然时机询问进展："
+                    f"「{summary[:80]}」。不必强行提起，若用户主动聊其他事则顺着走。"
+                )
     except Exception:
-        try:
-            cursor = await conn.execute(
-                """SELECT m.role, m.content FROM messages m
-                   JOIN sessions s ON s.id = m.session_id
-                   WHERE s.user_id = ? AND date(s.started_at) = date('now', 'localtime')
-                   ORDER BY m.id ASC""",
-                (user_id,),
-            )
-            rows = await cursor.fetchall()
-            mood_messages = [{"role": r["role"], "content": (r["content"] or "")} for r in rows]
-        except Exception:
-            pass
-    if not mood_messages:
-        return "平静"
-    try:
-        return await analyze_mood(mood_messages) or "平静"
-    except Exception:
-        return "平静"
+        pass
+    return ""
 
 
-async def _run_chat(user_id: int, session_id: Optional[int], message: str, image_path: Optional[str] = None):
+async def _run_chat(user_id: int, session_id: Optional[int], message: str, image_path: Optional[str] = None, weather: Optional[str] = None):
     """内部：执行一轮对话（可带图片），返回 (session_id, reply, reminder)。"""
     await ensure_user(user_id)
     conn = await get_db()
@@ -295,22 +456,39 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
         row = await cursor.fetchone()
         last_login = row["last_login_at"] if row else None
         reminder = await get_reminder_if_inactive(last_login)
+        followup_hint = ""
         if session_id is None:
+            followup_hint = await _get_followup_hint(user_id, conn)
             await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
             await conn.commit()
             cursor = await conn.execute("SELECT last_insert_rowid() AS id")
             session_id = (await cursor.fetchone())["id"]
         try:
             cursor = await conn.execute(
-                "SELECT role, content, image_path FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 30",
+                "SELECT role, content, image_path FROM messages WHERE session_id = ? ORDER BY id ASC",
                 (session_id,),
             )
         except Exception:
             cursor = await conn.execute(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 30",
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
                 (session_id,),
             )
         rows = await cursor.fetchall()
+        # 上下文窗口优化：只保留最近 12 条，若有更早内容则注入 session 摘要作补充
+        CONTEXT_LIMIT = 12
+        context_prefix = []
+        if len(rows) > CONTEXT_LIMIT:
+            older_rows = rows[:-CONTEXT_LIMIT]
+            rows = rows[-CONTEXT_LIMIT:]
+            # 尝试从 session 摘要获取早期内容的精华
+            cursor2 = await conn.execute("SELECT summary FROM sessions WHERE id = ?", (session_id,))
+            srow2 = await cursor2.fetchone()
+            session_summary = srow2["summary"] if srow2 and srow2["summary"] else None
+            if session_summary:
+                context_prefix = [{"role": "system", "content": f"[本次对话前期摘要] {session_summary}"}]
+            else:
+                # 没有摘要时用截断提示，避免模型产生"我们之前没聊过"的误解
+                context_prefix = [{"role": "system", "content": f"[本次对话已有 {len(older_rows) + len(rows)} 条消息，以下仅展示最近 {CONTEXT_LIMIT} 条]"}]
         history = []
         for r in rows:
             role, content = r["role"], r["content"]
@@ -318,39 +496,56 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             if role == "user" and img_path:
                 content = _image_path_to_content_parts(content or "", img_path, UPLOAD_DIR)
             history.append({"role": role, "content": content})
-        _kws = _extract_keywords(message)[:6]
-        had_any = False
-        if _is_rag_skip_follow_up(message):
-            rag_texts, rag_mode = [], "keyword"
-            intent = "chat"
-        else:
-            intent = await detect_intent(message)
-            if any(h in (message or "") for h in _KB_TOPIC_HINTS):
-                intent = "ask_kb"
-            if intent == "ask_kb":
-                rag_texts, rag_mode = await get_relevant_context(message, user_id)
-                had_any = bool(rag_texts)
-                if not _should_inject_rag(message, rag_texts, _kws):
-                    rag_texts = []
-            else:
-                rag_texts, rag_mode = [], "keyword"
-            RAG_STATS["total"] += 1 if intent == "ask_kb" else 0
-            if rag_texts:
-                RAG_STATS["hits"] += 1
         cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
         srow = await cursor.fetchone()
         has_anxiety = bool(srow and srow["anxiety_detected"])
-        extra_system, rag_user_prefix = build_chat_context(rag_texts, has_anxiety)
-        current_user_content = (rag_user_prefix + message) if rag_user_prefix else message
-        if rag_user_prefix:
-            current_user_content += "\n\n（若用户问的是参考主题相关的内容，只依据上述内容回答且回复自然，勿出现「参考」「资料」等词；若是闲聊则正常回复。）"
+        memories = await retrieve_relevant_memories(
+            user_id=user_id,
+            query=message,
+            exclude_session_id=session_id,
+        )
+        extra_system_parts = []
+        if followup_hint:
+            extra_system_parts.append(followup_hint)
+        if weather:
+            extra_system_parts.append(f"当前天气：{weather}。可在自然的情况下将天气融入对话，不要强行提及。")
+        if has_anxiety:
+            extra_system_parts.append("注意：用户近期对话中曾表现出焦虑或压力，回复时请更温柔、多些共情与支持。")
+        if memories:
+            memory_block = (
+                "以下是该用户的历史对话片段（长期记忆）：\n"
+                + "\n".join(f"- {m}" for m in memories[:6])
+                + "\n\n请优先依据这些片段回答用户的偏好/经历/之前提到的事情。"
+                + " 若片段包含用户的姓名/称呼/自我介绍，当用户询问你还记得我名字吗等身份信息时，直接给出姓名或称呼。"
+                + " 若用户在追问是否记得/之前聊过什么，请先给出结论再自然展开。"
+            )
+            if _is_memory_recall_query(message):
+                memory_block += "（追问场景：优先从长期记忆给出直接结论）"
+            extra_system_parts.append(memory_block)
+        extra_system = "\n\n".join(extra_system_parts)
+        print(f"[Memory] 命中 {len(memories)} 条 | session={session_id} | q={message[:30]}")
+        current_user_content = message
         if image_path:
-            current_user_content = _image_path_to_content_parts(current_user_content, image_path, UPLOAD_DIR)
+            current_user_content = _image_path_to_content_parts(message, image_path, UPLOAD_DIR)
         messages = [{"role": "system", "content": COMPANION_SYSTEM}]
+        messages.extend(context_prefix)
         messages.extend(history)
         messages.append({"role": "user", "content": current_user_content})
+        # function call RAG：追问类跳过工具，否则让模型自己决定是否查知识库
+        use_tool = not _is_rag_skip_follow_up(message)
+        force_tool = use_tool and any(kw in message for kw in _KNOWLEDGE_KEYWORDS)
+        if use_tool:
+            async def _rag_fn(query: str) -> list[str]:
+                texts, _, _ = await get_relevant_context(query, user_id)
+                RAG_STATS["total"] += 1
+                if texts:
+                    RAG_STATS["hits"] += 1
+                print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
+                return texts
+        else:
+            _rag_fn = None
         try:
-            reply = await chat(messages, extra_system=extra_system)
+            reply = await chat_with_knowledge(messages, extra_system=extra_system, rag_fn=_rag_fn, force_tool=force_tool)
         except Exception as e:
             err = str(e).strip() or "API 调用失败"
             if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
@@ -381,14 +576,213 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
                 (session_id, "assistant", reply),
             )
         await conn.commit()
-        mood = await _get_today_mood(conn, user_id)
-        return {"session_id": session_id, "reply": reply, "reminder": reminder, "mood": mood or "平静"}
+        await add_turn_to_memory(
+            user_id=user_id,
+            session_id=session_id,
+            user_message=message,
+            assistant_reply=reply,
+        )
+        import asyncio
+        asyncio.ensure_future(extract_and_save_profiles(
+            user_id=user_id,
+            session_id=session_id,
+            user_message=message,
+            db_path=DB_PATH,
+        ))
+        mood = await _get_current_mood(conn, session_id)
+        messages_list = _split_reply(reply)
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "messages": messages_list,
+            "reminder": reminder,
+            "mood": mood or "平静",
+            "anxiety_detected": has_anxiety,
+        }
+    finally:
+        await conn.close()
+
+
+# ---------- Auth 端点 ----------
+@app.post("/api/auth/register")
+async def api_register(req: RegisterRequest):
+    """注册新账号，成功后返回 token（前端存 localStorage）。"""
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="请输入有效的邮箱地址")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少 6 位")
+    conn = await get_db()
+    try:
+        # 邮箱已注册则拒绝
+        cursor = await conn.execute("SELECT id FROM users WHERE email = ?", (email,))
+        if await cursor.fetchone():
+            raise HTTPException(status_code=409, detail="该邮箱已注册，请直接登录")
+        hashed = _bcrypt.hashpw(req.password.encode(), _bcrypt.gensalt()).decode()
+        name = (req.name or "").strip() or email.split("@")[0]
+        # 若 user_id=1 是无邮箱的旧匿名用户（加多用户前的遗留数据），直接接管以保留历史记录
+        cursor = await conn.execute("SELECT id, email FROM users WHERE id = 1")
+        legacy = await cursor.fetchone()
+        if legacy and not legacy["email"]:
+            user_id = 1
+            await conn.execute(
+                "UPDATE users SET name=?, email=?, password_hash=?, last_login_at=datetime('now') WHERE id=1",
+                (name, email, hashed),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO users (name, email, password_hash, last_login_at) VALUES (?, ?, ?, datetime('now'))",
+                (name, email, hashed),
+            )
+            cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+            user_id = (await cursor.fetchone())["id"]
+        await conn.commit()
+    finally:
+        await conn.close()
+    token = await _create_token(user_id)
+    return {"user_id": user_id, "name": name, "email": email, "token": token}
+
+
+@app.post("/api/auth/login")
+async def api_login(req: LoginRequest):
+    """用邮箱+密码登录，成功后返回 token。"""
+    email = (req.email or "").strip().lower()
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT id, name, password_hash FROM users WHERE email = ?", (email,)
+        )
+        row = await cursor.fetchone()
+        if not row or not row["password_hash"]:
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        if not _bcrypt.checkpw(req.password.encode(), row["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        user_id = row["id"]
+        name = row["name"] or email.split("@")[0]
+        await conn.execute(
+            "UPDATE users SET last_login_at = datetime('now') WHERE id = ?", (user_id,)
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+    token = await _create_token(user_id)
+    return {"user_id": user_id, "name": name, "email": email, "token": token}
+
+
+@app.post("/api/auth/logout")
+async def api_logout(authorization: Optional[str] = Header(None)):
+    """登出：删除服务端 token。"""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        conn = await get_db()
+        try:
+            await conn.execute("DELETE FROM user_tokens WHERE token = ?", (token,))
+            await conn.commit()
+        finally:
+            await conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/auth/change-password")
+async def api_change_password(
+    current_password: str = Body(...),
+    new_password: str = Body(...),
+    user_id: int = Depends(get_current_user),
+):
+    """修改密码：需要提供当前密码验证身份。"""
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少 6 位")
+    conn = await get_db()
+    try:
+        cursor = await conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row or not row["password_hash"]:
+            raise HTTPException(status_code=400, detail="账号异常，请重新登录")
+        if not _bcrypt.checkpw(current_password.encode(), row["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="当前密码错误")
+        new_hash = _bcrypt.hashpw(new_password.encode(), _bcrypt.gensalt()).decode()
+        await conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, user_id))
+        # 让其他设备上的 token 全部失效（安全起见），保留当前 token
+        await conn.commit()
+    finally:
+        await conn.close()
+    return {"ok": True}
+
+
+@app.delete("/api/auth/account")
+async def api_delete_account(
+    password: str = Body(...),
+    user_id: int = Depends(get_current_user),
+):
+    """注销账号：删除该用户的全部数据（消息、会话、token、向量记忆、上传图片）。"""
+    conn = await get_db()
+    try:
+        # 验证密码
+        cursor = await conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row or not row["password_hash"]:
+            raise HTTPException(status_code=400, detail="账号异常")
+        if not _bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="密码错误，注销已取消")
+        # 删除消息（通过 session）
+        cursor = await conn.execute("SELECT id FROM sessions WHERE user_id = ?", (user_id,))
+        session_ids = [r["id"] for r in await cursor.fetchall()]
+        if session_ids:
+            ph = ",".join("?" * len(session_ids))
+            # 收集图片路径
+            cursor = await conn.execute(
+                f"SELECT image_path FROM messages WHERE session_id IN ({ph}) AND image_path IS NOT NULL",
+                session_ids,
+            )
+            img_paths = [r["image_path"] for r in await cursor.fetchall()]
+            await conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", session_ids)
+        else:
+            img_paths = []
+        await conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM reminders WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+    # 删除上传图片
+    for img in img_paths:
+        try:
+            (UPLOAD_DIR / img).unlink(missing_ok=True)
+        except Exception:
+            pass
+    # 删除向量记忆
+    try:
+        from services.long_memory import _get_collection
+        import asyncio
+        def _del_chroma():
+            c = _get_collection()
+            if c:
+                results = c.get(where={"user_id": int(user_id)}, include=[])
+                if results and results.get("ids"):
+                    c.delete(ids=results["ids"])
+        await asyncio.get_event_loop().run_in_executor(None, _del_chroma)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def api_me(user_id: int = Depends(get_current_user)):
+    """返回当前登录用户信息（前端用于判断是否已登录）。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="用户不存在")
+        return {"user_id": user_id, "name": row["name"], "email": row["email"]}
     finally:
         await conn.close()
 
 
 @app.get("/api/mood")
-async def api_mood(user_id: int = 1):
+async def api_mood(user_id: int = Depends(get_current_user)):
     """获取当天综合心情（以当天截至当前的所有对话计算），用于页面展示。"""
     try:
         conn = await get_db()
@@ -402,19 +796,19 @@ async def api_mood(user_id: int = 1):
 
 
 @app.post("/api/chat")
-async def api_chat(req: ChatRequest):
+async def api_chat(req: ChatRequest, user_id: int = Depends(get_current_user)):
     """发送一条消息，返回小伴回复。若久未登录会先返回提醒再正常对话。"""
     if not (OPENAI_API_KEY or "").strip():
         raise HTTPException(status_code=503, detail="未配置 API 密钥。请在项目文件夹中创建 .env 文件，填写：OPENAI_API_KEY=你的密钥")
-    return await _run_chat(req.user_id, req.session_id, req.message, None)
+    return await _run_chat(user_id, req.session_id, req.message, None, req.weather)
 
 
 @app.post("/api/chat/send")
 async def api_chat_send(
     message: str = Form(""),
-    user_id: int = Form(1),
     session_id: Optional[int] = Form(None),
     image: Optional[UploadFile] = File(None),
+    user_id: int = Depends(get_current_user),
 ):
     """发送消息并可附带一张图片（multipart/form-data）。"""
     if not (OPENAI_API_KEY or "").strip():
@@ -444,16 +838,16 @@ async def api_chat_send(
 
 
 @app.post("/api/chat/stream")
-async def api_chat_stream(req: ChatRequest):
+async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_user)):
     """流式回复（仅返回 assistant 内容，不写库；如需写库可先非流式写再这里只做展示）。"""
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="未配置 OPENAI_API_KEY")
-    await ensure_user(req.user_id)
+    await ensure_user(user_id)
     conn = await get_db()
     try:
         session_id = req.session_id
         if session_id is None:
-            await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (req.user_id,))
+            await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
             await conn.commit()
             cursor = await conn.execute("SELECT last_insert_rowid() AS id")
             session_id = (await cursor.fetchone())["id"]
@@ -462,46 +856,51 @@ async def api_chat_stream(req: ChatRequest):
             (session_id,),
         )
         history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
-        had_any = False
-        if _is_rag_skip_follow_up(req.message):
-            rag_texts, rag_mode = [], "keyword"
-        else:
-            rag_texts, rag_mode = await get_relevant_context(req.message, req.user_id)
-            had_any = bool(rag_texts)
-            if not _should_inject_rag(req.message, rag_texts, _extract_keywords(req.message)[:6]):
-                rag_texts = []
-            RAG_STATS["total"] += 1
-            if rag_texts:
-                RAG_STATS["hits"] += 1
-        pct = round(100 * RAG_STATS["hits"] / RAG_STATS["total"]) if RAG_STATS["total"] else 0
-        _kws = _extract_keywords(req.message)[:6]
-        kw_str = ", ".join(_kws)
-        mode_cn = "语义" if rag_mode == "semantic" else "关键词"
-        if _is_rag_skip_follow_up(req.message):
-            print(f"[RAG] 跳过（追问）| 用户: {req.message[:20]}…")
-        elif had_any and not rag_texts:
-            print(f"[RAG] 跳过（与知识库无关）| 用户: {req.message[:30]}…")
-        elif rag_texts:
-            print(f"[RAG] {mode_cn} | 关键词: {kw_str} | 本次检索到 {len(rag_texts)} 条 | 命中率 {RAG_STATS['hits']}/{RAG_STATS['total']} ({pct}%)")
-        else:
-            print(f"[RAG] {mode_cn} | 关键词: {kw_str} | 未检索到 | 命中率 {RAG_STATS['hits']}/{RAG_STATS['total']} ({pct}%)")
         cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
         srow = await cursor.fetchone()
         has_anxiety = bool(srow and srow["anxiety_detected"])
-        extra_system, rag_user_prefix = build_chat_context(rag_texts, has_anxiety)
-        current_user_content = (rag_user_prefix + req.message) if rag_user_prefix else req.message
-        if rag_user_prefix:
-            current_user_content += "\n\n（若用户问的是参考主题相关的内容，只依据上述内容回答且回复自然，勿出现「参考」「资料」等词；若是闲聊则正常回复。）"
-        if rag_texts:
-            preview = (rag_texts[0][:400] + "…") if len(rag_texts[0]) > 400 else rag_texts[0]
-            print(f"[RAG] 注入参考预览: {preview}")
+        memories = await retrieve_relevant_memories(
+            user_id=user_id,
+            query=req.message,
+            exclude_session_id=session_id,
+        )
+        extra_system_parts = []
+        if req.weather:
+            extra_system_parts.append(f"当前天气：{req.weather}。可在自然的情况下将天气融入对话，不要强行提及。")
+        if has_anxiety:
+            extra_system_parts.append("注意：用户近期对话中曾表现出焦虑或压力，回复时请更温柔、多些共情与支持。")
+        if memories:
+            memory_block = (
+                "以下是该用户的历史对话片段（长期记忆）：\n"
+                + "\n".join(f"- {m}" for m in memories[:6])
+                + "\n\n请优先依据这些片段回答用户的偏好/经历/之前提到的事情。"
+                + " 若片段包含用户的姓名/称呼/自我介绍，当用户询问你还记得我名字吗等身份信息时，直接给出姓名或称呼。"
+                + " 若用户在追问是否记得/之前聊过什么，请先给出结论再自然展开。"
+            )
+            if _is_memory_recall_query(req.message):
+                memory_block += "（追问场景：优先从长期记忆给出直接结论）"
+            extra_system_parts.append(memory_block)
+        extra_system = "\n\n".join(extra_system_parts)
+        print(f"[Memory] 命中 {len(memories)} 条 | session={session_id} | q={req.message[:30]}")
         messages = [{"role": "system", "content": COMPANION_SYSTEM}]
         messages.extend(history)
-        messages.append({"role": "user", "content": current_user_content})
+        messages.append({"role": "user", "content": req.message})
+        use_tool = not _is_rag_skip_follow_up(req.message)
+        force_tool = use_tool and any(kw in req.message for kw in _KNOWLEDGE_KEYWORDS)
+        if use_tool:
+            async def _stream_rag_fn(query: str) -> list[str]:
+                texts, _, _ = await get_relevant_context(query, user_id)
+                RAG_STATS["total"] += 1
+                if texts:
+                    RAG_STATS["hits"] += 1
+                print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
+                return texts
+        else:
+            _stream_rag_fn = None
 
         async def gen():
             full = []
-            async for chunk in chat_stream(messages, extra_system=extra_system):
+            async for chunk in chat_stream_with_knowledge(messages, extra_system=extra_system, rag_fn=_stream_rag_fn, force_tool=force_tool):
                 full.append(chunk)
                 yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
             # 流式结束后可异步写库（此处简化，仅做演示）
@@ -515,6 +914,19 @@ async def api_chat_stream(req: ChatRequest):
                 (session_id, "assistant", content),
             )
             await conn.commit()
+            await add_turn_to_memory(
+                user_id=user_id,
+                session_id=session_id,
+                user_message=req.message,
+                assistant_reply=content,
+            )
+            import asyncio
+            asyncio.ensure_future(extract_and_save_profiles(
+                user_id=user_id,
+                session_id=session_id,
+                user_message=req.message,
+                db_path=DB_PATH,
+            ))
 
         return StreamingResponse(
             gen(),
@@ -563,7 +975,7 @@ async def api_end_session(req: EndSessionRequest):
 
 # ---------- 会话列表（左侧栏：不同话题，可继续上次对话）----------
 @app.get("/api/sessions")
-async def api_sessions(user_id: int = 1, limit: int = 50):
+async def api_sessions(user_id: int = Depends(get_current_user), limit: int = 50):
     """获取用户的会话列表（含未结束的），按开始时间倒序。用于左侧栏展示、点击后加载该会话消息。"""
     conn = await get_db()
     try:
@@ -590,7 +1002,7 @@ async def api_sessions(user_id: int = 1, limit: int = 50):
 
 
 @app.get("/api/sessions/{session_id}/messages")
-async def api_session_messages(session_id: int, user_id: int = 1):
+async def api_session_messages(session_id: int, user_id: int = Depends(get_current_user)):
     """获取某会话的全部消息，用于切换会话时加载历史并继续对话。校验 session 属于当前用户。"""
     conn = await get_db()
     try:
@@ -616,8 +1028,119 @@ async def api_session_messages(session_id: int, user_id: int = 1):
         await conn.close()
 
 
+@app.get("/api/search")
+async def api_search(user_id: int = Depends(get_current_user), q: str = ""):
+    """搜索摘要和消息内容，返回匹配的 session 列表。"""
+    q = q.strip()
+    if not q:
+        return []
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT DISTINCT s.id, s.started_at, s.summary, s.mood, s.anxiety_detected
+               FROM sessions s
+               LEFT JOIN messages m ON m.session_id = s.id
+               WHERE s.user_id = ?
+                 AND (s.summary LIKE ? OR m.content LIKE ?)
+               ORDER BY s.started_at DESC
+               LIMIT 30""",
+            (user_id, f"%{q}%", f"%{q}%"),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "session_id": r["id"],
+                "started_at": r["started_at"],
+                "summary": r["summary"] or "",
+                "mood": r["mood"] or "",
+                "anxiety_detected": bool(r["anxiety_detected"]),
+            }
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+
+@app.get("/api/export/markdown")
+async def api_export_markdown(user_id: int = Depends(get_current_user)):
+    """将用户所有会话导出为 Markdown 文件。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT id, started_at, mood, summary
+               FROM sessions WHERE user_id = ?
+               ORDER BY started_at ASC""",
+            (user_id,),
+        )
+        sessions = await cursor.fetchall()
+
+        lines = [f"# 树洞日记 · 我的记录\n\n导出时间：{__import__('datetime').date.today()}\n\n---\n"]
+        for s in sessions:
+            date = (s["started_at"] or "")[:16].replace("T", " ")
+            mood = s["mood"] or "—"
+            lines.append(f"\n## {date}　心情：{mood}\n")
+            if s["summary"]:
+                lines.append(f"{s['summary']}\n")
+            cursor2 = await conn.execute(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+                (s["id"],),
+            )
+            msgs = await cursor2.fetchall()
+            if msgs:
+                lines.append("\n<details><summary>查看对话记录</summary>\n")
+                for m in msgs:
+                    role_label = "我" if m["role"] == "user" else "小伴"
+                    lines.append(f"\n**{role_label}**：{m['content'] or ''}")
+                lines.append("\n\n</details>\n")
+            lines.append("\n---\n")
+
+        content = "\n".join(lines)
+        return Response(
+            content=content.encode("utf-8"),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename*=UTF-8''treeholediary.md"},
+        )
+    finally:
+        await conn.close()
+
+
+@app.get("/api/mood/calendar")
+async def api_mood_calendar(user_id: int = Depends(get_current_user), year: int = 0, month: int = 0):
+    """返回指定月份每天的情绪（用于日历热力图）。"""
+    import datetime
+    if not year:
+        year = datetime.date.today().year
+    if not month:
+        month = datetime.date.today().month
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-31"
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT date(started_at) as day, mood, anxiety_detected
+               FROM sessions WHERE user_id = ? AND date(started_at) BETWEEN ? AND ?
+               ORDER BY started_at ASC""",
+            (user_id, start, end),
+        )
+        rows = await cursor.fetchall()
+        result: dict[str, dict] = {}
+        for r in rows:
+            day = r["day"]
+            mood = r["mood"] or ""
+            neg = bool(re.search(r"焦虑|难过|疲惫|烦躁|委屈|低落|压力|紧张|恐惧|绝望|崩溃", mood))
+            pos = bool(re.search(r"开心|兴奋|愉快|高兴|喜悦|放松|安心|满足|轻松|平和|平静", mood))
+            result[day] = {
+                "mood": mood,
+                "category": "negative" if neg else ("positive" if pos else "neutral"),
+                "anxiety": bool(r["anxiety_detected"]),
+            }
+        return result
+    finally:
+        await conn.close()
+
+
 @app.patch("/api/sessions/{session_id}")
-async def api_rename_session(session_id: int, req: RenameSessionRequest, user_id: int = 1):
+async def api_rename_session(session_id: int, req: RenameSessionRequest, user_id: int = Depends(get_current_user)):
     """重命名会话（设置 title）。仅允许修改当前用户的会话。"""
     conn = await get_db()
     try:
@@ -637,7 +1160,7 @@ async def api_rename_session(session_id: int, req: RenameSessionRequest, user_id
 
 
 @app.delete("/api/sessions/{session_id}")
-async def api_delete_session(session_id: int, user_id: int = 1):
+async def api_delete_session(session_id: int, user_id: int = Depends(get_current_user)):
     """删除会话及其全部消息。仅允许删除当前用户的会话。"""
     conn = await get_db()
     try:
@@ -656,7 +1179,7 @@ async def api_delete_session(session_id: int, user_id: int = 1):
 
 # ---------- 总结列表 ----------
 @app.get("/api/summaries")
-async def api_summaries(user_id: int = 1, limit: int = 20):
+async def api_summaries(user_id: int = Depends(get_current_user), limit: int = 20):
     """获取用户的历史会话总结（生活记录），含该会话中用户分享的图片列表。"""
     conn = await get_db()
     try:
@@ -728,12 +1251,32 @@ async def api_debug_rag(q: str = ""):
     """调试用：查看问题 q 会检索到并注入的参考内容。方便核对「答案在知识库但没答对」是检索问题还是模型问题。"""
     if not q.strip():
         return {"query": "", "mode": "", "count": 0, "snippets": [], "hint": "请加参数 ?q=你的问题，例如 ?q=什么是广泛性焦虑"}
-    rag_texts, mode = await get_relevant_context(q.strip(), user_id=1, limit=8)
+    rag_texts, mode, score = await get_relevant_context(q.strip(), user_id=1, limit=8)
     return {
         "query": q.strip(),
         "mode": mode,
+        "best_score": round(score, 4),
+        "injected": bool(rag_texts),
         "count": len(rag_texts),
         "snippets": [s[:800] + ("…" if len(s) > 800 else "") for s in rag_texts],
+    }
+
+
+@app.get("/api/debug/memory")
+async def api_debug_memory(q: str = "", user_id: int = 1, session_id: int | None = None, limit: int = 6):
+    """调试长期记忆召回：查看问题 q 会命中的历史对话片段。"""
+    if not q.strip():
+        return {"query": "", "count": 0, "snippets": [], "hint": "请加参数 ?q=你的问题，例如 ?q=你还记得我喜欢什么吗"}
+    items = await retrieve_relevant_memories(
+        user_id=user_id,
+        query=q.strip(),
+        exclude_session_id=session_id,
+        limit=max(1, min(limit, 12)),
+    )
+    return {
+        "query": q.strip(),
+        "count": len(items),
+        "snippets": [s[:500] + ("…" if len(s) > 500 else "") for s in items],
     }
 
 
@@ -766,30 +1309,30 @@ async def api_list_knowledge(limit: int = 50):
 @app.post("/api/knowledge")
 async def api_add_knowledge(req: AddKnowledgeRequest):
     """添加一条知识/文章（标题、内容、来源链接），聊天时会做语义/关键词检索并引用。"""
+    import asyncio
     conn = await get_db()
+    chunk_ids: list[int] = []
     try:
-        text_for_emb = (req.title or "") + "\n" + (req.content or "")
-        emb = await get_embedding(text_for_emb)
-        emb_json = json.dumps(emb) if emb else None
-        try:
+        use_title = (req.title or "").strip()
+        content = (req.content or "").strip()
+        _enforce_knowledge_text_limit(content)
+        src = (req.source_url or "").strip()
+        chunks = _chunk_text(content) or [content]
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            chunk_title = f"{use_title}（{i + 1}/{total}）" if total > 1 and use_title else use_title
             await conn.execute(
-                "INSERT INTO knowledge (title, content, source_url, embedding) VALUES (?, ?, ?, ?)",
-                (req.title or "", req.content.strip(), req.source_url or "", emb_json),
+                "INSERT INTO knowledge (title, content, source_url) VALUES (?, ?, ?)",
+                (chunk_title, chunk, src),
             )
-        except Exception as e:
-            if "no such column" in str(e).lower() or "embedding" in str(e).lower():
-                await conn.execute(
-                    "INSERT INTO knowledge (title, content, source_url) VALUES (?, ?, ?)",
-                    (req.title or "", req.content.strip(), req.source_url or ""),
-                )
-            else:
-                raise
-        await conn.commit()
-        cursor = await conn.execute("SELECT last_insert_rowid() AS id")
-        kid = (await cursor.fetchone())["id"]
-        return {"id": kid}
+            await conn.commit()
+            cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+            chunk_ids.append((await cursor.fetchone())["id"])
     finally:
         await conn.close()
+    if chunk_ids:
+        asyncio.create_task(_backfill_embeddings(chunk_ids))
+    return {"id": chunk_ids[0] if chunk_ids else None, "chunks": total}
 
 
 @app.delete("/api/knowledge/{kid}")
@@ -805,28 +1348,73 @@ async def api_delete_knowledge(kid: int):
 
 
 def _extract_text_from_file(file: UploadFile) -> str:
-    """根据文件名后缀解析文本：支持 .txt、.pdf。"""
+    """根据文件名后缀解析文本：支持 .txt、.pdf。读入与提取均受配置上限保护。"""
     name = (file.filename or "").lower()
-    raw = file.file.read()
+    raw = _read_upload_bytes_limited(file)
     if name.endswith(".txt"):
         try:
-            return raw.decode("utf-8")
+            text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            return raw.decode("gbk", errors="replace")
+            text = raw.decode("gbk", errors="replace")
+        _enforce_knowledge_text_limit(text)
+        return text
     if name.endswith(".pdf"):
         try:
             from pypdf import PdfReader
             import io
+
             reader = PdfReader(io.BytesIO(raw))
-            parts = []
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"PDF 读取失败: {e}")
+        cap = MAX_KNOWLEDGE_TEXT_CHARS
+        parts: list[str] = []
+        total = 0
+        try:
             for page in reader.pages:
-                t = page.extract_text()
-                if t:
-                    parts.append(t)
-            return "\n\n".join(parts) if parts else ""
+                t = (page.extract_text() or "").strip()
+                if not t:
+                    continue
+                if total + len(t) > cap:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"PDF 提取正文超过上限（{cap} 字）。请拆分或减少页数，或在 .env 增大 MAX_KNOWLEDGE_TEXT_CHARS。",
+                    )
+                parts.append(t)
+                total += len(t)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"PDF 解析失败: {e}")
+        return "\n\n".join(parts) if parts else ""
     raise HTTPException(status_code=400, detail="仅支持 .txt 或 .pdf 文件")
+
+
+async def _backfill_embeddings(chunk_ids: list[int]) -> None:
+    """后台任务：为刚入库的 chunk 逐一生成 embedding 并回填。不阻塞上传响应。"""
+    import asyncio
+    conn = await get_db()
+    try:
+        for kid in chunk_ids:
+            cursor = await conn.execute(
+                "SELECT title, content FROM knowledge WHERE id = ?", (kid,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                continue
+            text_for_emb = (row["title"] or "") + "\n" + (row["content"] or "")
+            try:
+                emb = await get_embedding(text_for_emb)
+                if emb:
+                    await conn.execute(
+                        "UPDATE knowledge SET embedding = ? WHERE id = ?",
+                        (json.dumps(emb), kid),
+                    )
+                    await conn.commit()
+            except Exception as e:
+                print(f"[Upload] embedding 回填失败 id={kid}: {e}")
+            await asyncio.sleep(0.05)  # 避免并发太快触发限速
+    finally:
+        await conn.close()
 
 
 @app.post("/api/knowledge/upload")
@@ -835,7 +1423,8 @@ async def api_upload_knowledge(
     title: str = Form(""),
     source_url: str = Form(""),
 ):
-    """上传文件到知识库：支持 .txt、.pdf，自动解析正文后入库。"""
+    """上传文件到知识库：支持 .txt、.pdf，自动分块入库，embedding 在后台异步生成。"""
+    import asyncio
     if not file.filename:
         raise HTTPException(status_code=400, detail="请选择文件")
     text = _extract_text_from_file(file)
@@ -843,35 +1432,38 @@ async def api_upload_knowledge(
         raise HTTPException(status_code=400, detail="文件内容为空或无法解析出文字")
     use_title = (title or "").strip() or (file.filename or "上传文件")
     content = text.strip()
-    text_for_emb = use_title + "\n" + content
-    emb = await get_embedding(text_for_emb)
-    emb_json = json.dumps(emb) if emb else None
+    src = (source_url or "").strip()
+    chunks = _chunk_text(content)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="文件内容为空或无法解析")
     conn = await get_db()
+    chunk_ids: list[int] = []
     try:
-        try:
-            await conn.execute(
-                "INSERT INTO knowledge (title, content, source_url, embedding) VALUES (?, ?, ?, ?)",
-                (use_title, content, (source_url or "").strip(), emb_json),
-            )
-        except Exception as e:
-            if "no such column" in str(e).lower() or "embedding" in str(e).lower():
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            chunk_title = f"{use_title}（{i + 1}/{total}）" if total > 1 else use_title
+            try:
                 await conn.execute(
                     "INSERT INTO knowledge (title, content, source_url) VALUES (?, ?, ?)",
-                    (use_title, content, (source_url or "").strip()),
+                    (chunk_title, chunk, src),
                 )
-            else:
-                raise
-        await conn.commit()
-        cursor = await conn.execute("SELECT last_insert_rowid() AS id")
-        kid = (await cursor.fetchone())["id"]
-        return {"id": kid, "title": use_title}
+                await conn.commit()
+                cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+                chunk_ids.append((await cursor.fetchone())["id"])
+            except Exception as e:
+                print(f"[Upload] 写入 chunk {i+1} 失败: {e}")
     finally:
         await conn.close()
+    if not chunk_ids:
+        raise HTTPException(status_code=500, detail="写入知识库失败")
+    # 后台异步生成 embedding，不阻塞本次请求
+    asyncio.create_task(_backfill_embeddings(chunk_ids))
+    return {"id": chunk_ids[0], "title": use_title, "chunks": total, "note": "文件已入库，向量索引正在后台生成，稍后即可语义检索"}
 
 
 # ---------- 健康检查与久未登录提醒 ----------
 @app.get("/api/check-in")
-async def api_check_in(user_id: int = 1, test_reminder: bool = False):
+async def api_check_in(user_id: int = Depends(get_current_user), test_reminder: bool = False):
     """用户打开应用时调用：先根据上次登录判断是否久未登录并返回提醒，再更新 last_login。
     test_reminder=True 时强制返回一条问候（用于本地测试久未登录效果），不修改 last_login。"""
     conn = await get_db()
@@ -889,6 +1481,23 @@ async def api_check_in(user_id: int = 1, test_reminder: bool = False):
         return {"reminder": reminder}
     finally:
         await conn.close()
+
+
+@app.get("/api/weather")
+async def api_weather(lat: float, lon: float):
+    """根据经纬度获取当前天气（通过 open-meteo.com，无需 API Key）。"""
+    try:
+        data = await get_weather(lat, lon)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"天气获取失败: {e}")
+
+
+@app.get("/api/report/weekly")
+async def api_weekly_report(user_id: int = Depends(get_current_user), week_offset: int = 0):
+    """获取情绪周报。week_offset=0 为本周，-1 为上周，以此类推。"""
+    data = await get_weekly_report(user_id, week_offset)
+    return data
 
 
 if __name__ == "__main__":

@@ -18,5 +18,11 @@ python-dotenv>=1.0.0
 pypdf>=4.0.0
 
 # 可选：RAG 向量检索（若需本地向量库可取消注释）
-# chromadb>=0.4.22
+chromadb>=0.5.5
 # sentence-transformers>=2.2.0
+
+# 中文分词（RAG 关键词提取）
+jieba>=0.42.1
+
+# 密码哈希（多用户登录）
+bcrypt>=4.0.0
