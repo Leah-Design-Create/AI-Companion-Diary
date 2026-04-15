@@ -35,3 +35,16 @@ Thumbs.db
 *.log
 *.tmp
 .cache/
+
+# Benchmark 测试产物
+benchmark.json
+benchmark_report.md
+benchmark_results/
+
+# 个人文档（不入库）
+竞品分析.md
+面试准备.md
+项目全貌-简历依据.md
+
+# 空文件
+py

@@ -3,6 +3,7 @@
 import base64
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from typing import Optional
 import secrets
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Cookie, Depends, Header, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Cookie, Depends, Header, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -27,11 +28,13 @@ from services.mood import analyze_mood
 from services.embedding import get_embedding
 from services.rag import get_relevant_context, _extract_keywords
 from services.summary import generate_summary
+from services.image_gen import generate_mood_image
 from services.reminder import get_reminder_if_inactive
 from services.tts import synthesize_to_mp3
 from services.long_memory import add_turn_to_memory, retrieve_relevant_memories, extract_and_save_profiles
 from services.report import get_weekly_report
 from services.weather import get_weather
+from services.evaluate import evaluate_response
 
 # RAG 调用统计（总次数、命中次数），用于看命中率
 RAG_STATS = {"total": 0, "hits": 0}
@@ -166,17 +169,20 @@ class LoginRequest(BaseModel):
     password: str
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)) -> int:
-    """FastAPI 依赖：从 Authorization: Bearer <token> 读取 token，返回 user_id；未登录则 401。"""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="未登录，请先注册或登录")
-    token = authorization.split(" ", 1)[1].strip()
-    if not token:
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),   # sendBeacon 走 query string
+) -> int:
+    """FastAPI 依赖：从 Authorization: Bearer <token> 或 ?token= 读取 token，返回 user_id；未登录则 401。"""
+    raw = token  # 优先 query string（sendBeacon 场景）
+    if not raw and authorization and authorization.startswith("Bearer "):
+        raw = authorization.split(" ", 1)[1].strip()
+    if not raw:
         raise HTTPException(status_code=401, detail="未登录，请先注册或登录")
     conn = await get_db()
     try:
         cursor = await conn.execute(
-            "SELECT user_id, expires_at FROM user_tokens WHERE token = ?", (token,)
+            "SELECT user_id, expires_at FROM user_tokens WHERE token = ?", (raw,)
         )
         row = await cursor.fetchone()
         if not row:
@@ -210,6 +216,7 @@ class ChatRequest(BaseModel):
     session_id: int | None = None  # 不传则新建会话
     message: str
     weather: str | None = None  # 天气摘要，如 "☀️ 北京，晴，28°C"
+    voice_hint: str | None = None  # 语音情绪信号，如 "声音较轻，语速偏慢"
 
 
 class EndSessionRequest(BaseModel):
@@ -379,6 +386,11 @@ async def _get_current_mood(conn, session_id: int) -> str:
         return "平静"
 
 
+def _clean_reply(text: str) -> str:
+    """去掉 [NEXT] 标记，返回纯文本，用于存库/长期记忆/评分。"""
+    return re.sub(r'\[NEXT\]', ' ', text).strip()
+
+
 def _split_reply(text: str) -> list[str]:
     """将 AI 回复拆分成 2-3 条短消息，模拟朋友连发的对话感。
     优先使用模型输出的 [NEXT] 分隔符，否则按句末标点自动分句合并。
@@ -413,6 +425,30 @@ def _split_reply(text: str) -> list[str]:
     if len(chunks) < 2:
         return [text.strip()]
     return chunks
+
+
+async def _run_evaluation(session_id: int, user_message: str, assistant_reply: str,
+                          latency_ms: int | None = None, token_count: int | None = None):
+    """后台异步评分，结果写入 evaluations 表，不阻塞主流程。"""
+    scores = await evaluate_response(user_message, assistant_reply)
+    if not scores:
+        return
+    conn = await get_db()
+    try:
+        await conn.execute(
+            """INSERT INTO evaluations
+               (session_id, user_message, assistant_reply, empathy, naturalness, helpfulness, safety, overall, comment, latency_ms, token_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, user_message[:500], assistant_reply[:1000],
+             scores["empathy"], scores["naturalness"], scores["helpfulness"],
+             scores["safety"], scores["overall"], scores["comment"], latency_ms, token_count),
+        )
+        await conn.commit()
+        print(f"[Evaluate] session={session_id} overall={scores['overall']} | {scores['comment']}")
+    except Exception as e:
+        print(f"[Evaluate] 写库失败: {e}")
+    finally:
+        await conn.close()
 
 
 _FOLLOWUP_KEYWORDS = ["准备", "打算", "计划", "在找", "在等", "想试", "想去", "想学", "要去", "正在", "面试", "申请", "等结果", "等消息"]
@@ -545,7 +581,9 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
         else:
             _rag_fn = None
         try:
-            reply = await chat_with_knowledge(messages, extra_system=extra_system, rag_fn=_rag_fn, force_tool=force_tool)
+            _t0 = time.monotonic()
+            reply, token_count = await chat_with_knowledge(messages, extra_system=extra_system, rag_fn=_rag_fn, force_tool=force_tool)
+            latency_ms = int((time.monotonic() - _t0) * 1000)
         except Exception as e:
             err = str(e).strip() or "API 调用失败"
             if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
@@ -557,6 +595,7 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             elif "vision" in err.lower() or "image" in err.lower() or "multimodal" in err.lower() or "content" in err.lower():
                 err = "当前模型可能不支持看图。发图片时请使用支持多模态的模型（如 gpt-4o、qwen-vl、glm-4v 等），并在 .env 中设置对应的 OPENAI_MODEL。"
             raise HTTPException(status_code=502, detail=err)
+        clean_reply = _clean_reply(reply)
         try:
             await conn.execute(
                 "INSERT INTO messages (session_id, role, content, image_path) VALUES (?, ?, ?, ?)",
@@ -564,7 +603,7 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             )
             await conn.execute(
                 "INSERT INTO messages (session_id, role, content, image_path) VALUES (?, ?, ?, ?)",
-                (session_id, "assistant", reply, None),
+                (session_id, "assistant", clean_reply, None),
             )
         except Exception:
             await conn.execute(
@@ -573,14 +612,17 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             )
             await conn.execute(
                 "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-                (session_id, "assistant", reply),
+                (session_id, "assistant", clean_reply),
             )
         await conn.commit()
+        cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+        msg_row = await cursor.fetchone()
+        message_id = msg_row["id"] if msg_row else None
         await add_turn_to_memory(
             user_id=user_id,
             session_id=session_id,
             user_message=message,
-            assistant_reply=reply,
+            assistant_reply=clean_reply,
         )
         import asyncio
         asyncio.ensure_future(extract_and_save_profiles(
@@ -589,6 +631,7 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             user_message=message,
             db_path=DB_PATH,
         ))
+        asyncio.ensure_future(_run_evaluation(session_id, message, clean_reply, latency_ms, token_count))
         mood = await _get_current_mood(conn, session_id)
         messages_list = _split_reply(reply)
         return {
@@ -598,6 +641,7 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             "reminder": reminder,
             "mood": mood or "平静",
             "anxiety_detected": has_anxiety,
+            "message_id": message_id,
         }
     finally:
         await conn.close()
@@ -844,81 +888,92 @@ async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_u
         raise HTTPException(status_code=503, detail="未配置 OPENAI_API_KEY")
     await ensure_user(user_id)
     conn = await get_db()
-    try:
-        session_id = req.session_id
-        if session_id is None:
-            await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
-            await conn.commit()
-            cursor = await conn.execute("SELECT last_insert_rowid() AS id")
-            session_id = (await cursor.fetchone())["id"]
-        cursor = await conn.execute(
-            """SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 30""",
-            (session_id,),
+    session_id = req.session_id
+    if session_id is None:
+        await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
+        await conn.commit()
+        cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+        session_id = (await cursor.fetchone())["id"]
+    cursor = await conn.execute(
+        """SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 30""",
+        (session_id,),
+    )
+    history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
+    cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
+    srow = await cursor.fetchone()
+    has_anxiety = bool(srow and srow["anxiety_detected"])
+    memories = await retrieve_relevant_memories(
+        user_id=user_id,
+        query=req.message,
+        exclude_session_id=session_id,
+    )
+    extra_system_parts = []
+    if req.weather:
+        extra_system_parts.append(f"当前天气：{req.weather}。可在自然的情况下将天气融入对话，不要强行提及。")
+    if req.voice_hint:
+        print(f"[VoiceHint] {req.voice_hint!r}")
+        extra_system_parts.append(f"【语音状态参考】用户本次说话时：{req.voice_hint}。请据此调整回应的语气和关注点，但不要直接提及这条信息。")
+    if has_anxiety:
+        extra_system_parts.append("注意：用户近期对话中曾表现出焦虑或压力，回复时请更温柔、多些共情与支持。")
+    if memories:
+        memory_block = (
+            "以下是该用户的历史对话片段（长期记忆）：\n"
+            + "\n".join(f"- {m}" for m in memories[:6])
+            + "\n\n请优先依据这些片段回答用户的偏好/经历/之前提到的事情。"
+            + " 若片段包含用户的姓名/称呼/自我介绍，当用户询问你还记得我名字吗等身份信息时，直接给出姓名或称呼。"
+            + " 若用户在追问是否记得/之前聊过什么，请先给出结论再自然展开。"
         )
-        history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
-        cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
-        srow = await cursor.fetchone()
-        has_anxiety = bool(srow and srow["anxiety_detected"])
-        memories = await retrieve_relevant_memories(
-            user_id=user_id,
-            query=req.message,
-            exclude_session_id=session_id,
-        )
-        extra_system_parts = []
-        if req.weather:
-            extra_system_parts.append(f"当前天气：{req.weather}。可在自然的情况下将天气融入对话，不要强行提及。")
-        if has_anxiety:
-            extra_system_parts.append("注意：用户近期对话中曾表现出焦虑或压力，回复时请更温柔、多些共情与支持。")
-        if memories:
-            memory_block = (
-                "以下是该用户的历史对话片段（长期记忆）：\n"
-                + "\n".join(f"- {m}" for m in memories[:6])
-                + "\n\n请优先依据这些片段回答用户的偏好/经历/之前提到的事情。"
-                + " 若片段包含用户的姓名/称呼/自我介绍，当用户询问你还记得我名字吗等身份信息时，直接给出姓名或称呼。"
-                + " 若用户在追问是否记得/之前聊过什么，请先给出结论再自然展开。"
-            )
-            if _is_memory_recall_query(req.message):
-                memory_block += "（追问场景：优先从长期记忆给出直接结论）"
-            extra_system_parts.append(memory_block)
-        extra_system = "\n\n".join(extra_system_parts)
-        print(f"[Memory] 命中 {len(memories)} 条 | session={session_id} | q={req.message[:30]}")
-        messages = [{"role": "system", "content": COMPANION_SYSTEM}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": req.message})
-        use_tool = not _is_rag_skip_follow_up(req.message)
-        force_tool = use_tool and any(kw in req.message for kw in _KNOWLEDGE_KEYWORDS)
-        if use_tool:
-            async def _stream_rag_fn(query: str) -> list[str]:
-                texts, _, _ = await get_relevant_context(query, user_id)
-                RAG_STATS["total"] += 1
-                if texts:
-                    RAG_STATS["hits"] += 1
-                print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
-                return texts
-        else:
-            _stream_rag_fn = None
+        if _is_memory_recall_query(req.message):
+            memory_block += "（追问场景：优先从长期记忆给出直接结论）"
+        extra_system_parts.append(memory_block)
+    extra_system = "\n\n".join(extra_system_parts)
+    print(f"[Memory] 命中 {len(memories)} 条 | session={session_id} | q={req.message[:30]}")
+    messages = [{"role": "system", "content": COMPANION_SYSTEM}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": req.message})
+    use_tool = not _is_rag_skip_follow_up(req.message)
+    force_tool = use_tool and any(kw in req.message for kw in _KNOWLEDGE_KEYWORDS)
+    if use_tool:
+        async def _stream_rag_fn(query: str) -> list[str]:
+            texts, _, _ = await get_relevant_context(query, user_id)
+            RAG_STATS["total"] += 1
+            if texts:
+                RAG_STATS["hits"] += 1
+            print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
+            return texts
+    else:
+        _stream_rag_fn = None
 
-        async def gen():
+    async def gen():
+        try:
+            # 第一帧返回 session_id，让前端能追踪会话
+            yield f"data: {json.dumps({'session_id': session_id}, ensure_ascii=False)}\n\n"
             full = []
+            _t0 = time.monotonic()
             async for chunk in chat_stream_with_knowledge(messages, extra_system=extra_system, rag_fn=_stream_rag_fn, force_tool=force_tool):
                 full.append(chunk)
                 yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
-            # 流式结束后可异步写库（此处简化，仅做演示）
+            stream_latency_ms = int((time.monotonic() - _t0) * 1000)
             content = "".join(full)
+            clean_content = _clean_reply(content)
             await conn.execute(
                 "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
                 (session_id, "user", req.message),
             )
             await conn.execute(
                 "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-                (session_id, "assistant", content),
+                (session_id, "assistant", clean_content),
             )
             await conn.commit()
+            cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+            msg_row = await cursor.fetchone()
+            if msg_row:
+                yield f"data: {json.dumps({'message_id': msg_row['id']})}\n\n"
             await add_turn_to_memory(
                 user_id=user_id,
                 session_id=session_id,
                 user_message=req.message,
-                assistant_reply=content,
+                assistant_reply=clean_content,
             )
             import asyncio
             asyncio.ensure_future(extract_and_save_profiles(
@@ -927,14 +982,15 @@ async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_u
                 user_message=req.message,
                 db_path=DB_PATH,
             ))
+            asyncio.ensure_future(_run_evaluation(session_id, req.message, clean_content, stream_latency_ms))
+        finally:
+            await conn.close()
 
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-    finally:
-        await conn.close()
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------- 结束会话并生成总结、焦虑分析 ----------
@@ -963,12 +1019,13 @@ async def api_end_session(req: EndSessionRequest):
             mood = await analyze_mood(messages) or "平静"
         except Exception:
             pass
+        mood_image_url = await generate_mood_image(mood, summary)
         await conn.execute(
-            "UPDATE sessions SET ended_at = datetime('now'), summary = ?, anxiety_detected = ?, mood = ? WHERE id = ?",
-            (summary, 1 if anxiety else 0, mood, req.session_id),
+            "UPDATE sessions SET ended_at = datetime('now'), summary = ?, anxiety_detected = ?, mood = ?, mood_image_url = ? WHERE id = ?",
+            (summary, 1 if anxiety else 0, mood, mood_image_url, req.session_id),
         )
         await conn.commit()
-        return {"session_id": req.session_id, "summary": summary, "anxiety_detected": anxiety, "mood": mood}
+        return {"session_id": req.session_id, "summary": summary, "anxiety_detected": anxiety, "mood": mood, "mood_image_url": mood_image_url}
     finally:
         await conn.close()
 
@@ -980,7 +1037,7 @@ async def api_sessions(user_id: int = Depends(get_current_user), limit: int = 50
     conn = await get_db()
     try:
         cursor = await conn.execute(
-            """SELECT id, started_at, ended_at, summary, title
+            """SELECT id, started_at, ended_at, summary, title, mood, mood_image_url
                FROM sessions WHERE user_id = ?
                ORDER BY started_at DESC LIMIT ?""",
             (user_id, limit),
@@ -995,6 +1052,8 @@ async def api_sessions(user_id: int = Depends(get_current_user), limit: int = 50
                 "ended_at": r["ended_at"],
                 "summary": r["summary"] if r["summary"] else None,
                 "title": title,
+                "mood": r["mood"] if "mood" in r.keys() else None,
+                "mood_image_url": r["mood_image_url"] if "mood_image_url" in r.keys() else None,
             })
         return out
     finally:
@@ -1184,7 +1243,7 @@ async def api_summaries(user_id: int = Depends(get_current_user), limit: int = 2
     conn = await get_db()
     try:
         cursor = await conn.execute(
-            """SELECT id, started_at, ended_at, summary, anxiety_detected, mood
+            """SELECT id, started_at, ended_at, summary, anxiety_detected, mood, mood_image_url
                FROM sessions WHERE user_id = ? AND summary IS NOT NULL AND summary != ''
                ORDER BY id DESC LIMIT ?""",
             (user_id, limit),
@@ -1218,6 +1277,7 @@ async def api_summaries(user_id: int = Depends(get_current_user), limit: int = 2
                 "summary": r["summary"],
                 "anxiety_detected": bool(r["anxiety_detected"]),
                 "mood": _mood(r),
+                "mood_image_url": r["mood_image_url"] if "mood_image_url" in r.keys() else None,
                 "images": images_by_session.get(r["id"], []),
             }
             for r in rows
@@ -1487,10 +1547,12 @@ async def api_check_in(user_id: int = Depends(get_current_user), test_reminder: 
 async def api_weather(lat: float, lon: float):
     """根据经纬度获取当前天气（通过 open-meteo.com，无需 API Key）。"""
     try:
-        data = await get_weather(lat, lon)
-        return data
+        result = await get_weather(lat, lon)
+        print(f"[Weather] 成功: {result.get('summary')}")
+        return result
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"天气获取失败: {e}")
+        print(f"[Weather] 失败: {type(e).__name__}: {e}")
+        return None
 
 
 @app.get("/api/report/weekly")
@@ -1498,6 +1560,413 @@ async def api_weekly_report(user_id: int = Depends(get_current_user), week_offse
     """获取情绪周报。week_offset=0 为本周，-1 为上周，以此类推。"""
     data = await get_weekly_report(user_id, week_offset)
     return data
+
+
+class FeedbackRequest(BaseModel):
+    message_id: int
+    rating: int  # 1 = 👍, -1 = 👎
+
+
+@app.post("/api/feedback")
+async def api_feedback(req: FeedbackRequest, user_id: int = Depends(get_current_user)):
+    """保存用户对某条 AI 回复的 👍/👎 反馈。"""
+    if req.rating not in (1, -1):
+        raise HTTPException(status_code=400, detail="rating 只能为 1 或 -1")
+    conn = await get_db()
+    try:
+        # 拿 session_id（方便后续统计）
+        cursor = await conn.execute(
+            "SELECT session_id FROM messages WHERE id = ?", (req.message_id,)
+        )
+        row = await cursor.fetchone()
+        session_id = row["session_id"] if row else None
+        # 如有旧反馈则更新，否则插入
+        await conn.execute(
+            """INSERT INTO message_feedback (message_id, session_id, user_id, rating)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
+            (req.message_id, session_id, user_id, req.rating),
+        )
+        # aiosqlite 不支持 UPSERT，改为先删后插
+        await conn.execute(
+            "DELETE FROM message_feedback WHERE message_id = ? AND user_id = ?",
+            (req.message_id, user_id),
+        )
+        await conn.execute(
+            "INSERT INTO message_feedback (message_id, session_id, user_id, rating) VALUES (?, ?, ?, ?)",
+            (req.message_id, session_id, user_id, req.rating),
+        )
+        await conn.commit()
+        return {"ok": True}
+    finally:
+        await conn.close()
+
+
+@app.get("/api/feedback/export")
+async def api_feedback_export(user_id: int = Depends(get_current_user)):
+    """导出该用户全部反馈为 CSV。"""
+    import csv, io
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT mf.id, mf.message_id, mf.rating, mf.created_at,
+                      m.content AS assistant_reply, mf.session_id
+               FROM message_feedback mf
+               LEFT JOIN messages m ON m.id = mf.message_id
+               WHERE mf.user_id = ?
+               ORDER BY mf.created_at DESC""",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "message_id", "rating", "created_at", "assistant_reply", "session_id"])
+        for r in rows:
+            writer.writerow([r["id"], r["message_id"], r["rating"], r["created_at"],
+                             (r["assistant_reply"] or "")[:200], r["session_id"]])
+        return Response(
+            content=output.getvalue().encode("utf-8-sig"),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="feedback.csv"'},
+        )
+    finally:
+        await conn.close()
+
+
+@app.get("/api/dashboard/stats")
+async def api_dashboard_stats(user_id: int = Depends(get_current_user)):
+    """看板数据：评分趋势 + 用户反馈统计。"""
+    conn = await get_db()
+    try:
+        # 评分趋势（最近 30 天，按天聚合）
+        cursor = await conn.execute(
+            """SELECT date(e.created_at) AS date,
+                      ROUND(AVG(e.overall), 2) AS avg_overall,
+                      ROUND(AVG(e.empathy), 2) AS empathy,
+                      ROUND(AVG(e.naturalness), 2) AS naturalness,
+                      ROUND(AVG(e.helpfulness), 2) AS helpfulness,
+                      ROUND(AVG(e.latency_ms), 0) AS avg_latency_ms,
+                      ROUND(AVG(e.token_count), 0) AS avg_token_count,
+                      COUNT(*) AS count
+               FROM evaluations e
+               JOIN sessions s ON s.id = e.session_id
+               WHERE s.user_id = ? AND e.created_at >= date('now', '-30 days')
+               GROUP BY date(e.created_at)
+               ORDER BY date ASC""",
+            (user_id,),
+        )
+        eval_trend = [dict(r) for r in await cursor.fetchall()]
+
+        # 反馈总计
+        cursor = await conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS up,
+                      SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END) AS down
+               FROM message_feedback WHERE user_id = ?""",
+            (user_id,),
+        )
+        fb_row = await cursor.fetchone()
+        feedback_summary = {
+            "total": fb_row["total"] or 0,
+            "up": fb_row["up"] or 0,
+            "down": fb_row["down"] or 0,
+        }
+
+        # 反馈趋势（最近 30 天）
+        cursor = await conn.execute(
+            """SELECT date(created_at) AS date,
+                      SUM(CASE WHEN rating = 1 THEN 1 ELSE 0 END) AS up,
+                      SUM(CASE WHEN rating = -1 THEN 1 ELSE 0 END) AS down
+               FROM message_feedback
+               WHERE user_id = ? AND created_at >= date('now', '-30 days')
+               GROUP BY date(created_at)
+               ORDER BY date ASC""",
+            (user_id,),
+        )
+        feedback_trend = [dict(r) for r in await cursor.fetchall()]
+
+        # 最近 10 条差评对话
+        cursor = await conn.execute(
+            """SELECT mf.created_at, mf.session_id, m.content AS assistant_reply,
+                      prev.content AS user_message
+               FROM message_feedback mf
+               LEFT JOIN messages m ON m.id = mf.message_id
+               LEFT JOIN messages prev ON prev.session_id = m.session_id
+                   AND prev.role = 'user'
+                   AND prev.id = (
+                       SELECT MAX(id) FROM messages
+                       WHERE session_id = m.session_id AND role = 'user' AND id < m.id
+                   )
+               WHERE mf.user_id = ? AND mf.rating = -1
+               ORDER BY mf.created_at DESC LIMIT 10""",
+            (user_id,),
+        )
+        recent_negative = [dict(r) for r in await cursor.fetchall()]
+
+        return {
+            "eval_trend": eval_trend,
+            "feedback_summary": feedback_summary,
+            "feedback_trend": feedback_trend,
+            "recent_negative": recent_negative,
+        }
+    finally:
+        await conn.close()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    """数据看板页面。"""
+    from pathlib import Path
+    p = Path("static/dashboard.html")
+    if p.exists():
+        return HTMLResponse(p.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="dashboard.html not found")
+
+
+@app.get("/api/evaluations/ping")
+async def api_evaluation_ping():
+    """直接测试 Gemini 评分是否可用，无需登录。"""
+    from config import GEMINI_API_KEY, GEMINI_MODEL
+    if not GEMINI_API_KEY:
+        return {"ok": False, "error": "GEMINI_API_KEY 未配置"}
+    try:
+        result = await evaluate_response("今天心情很糟糕", "听起来你今天过得不太好，能说说发生什么了吗？")
+        if result:
+            return {"ok": True, "result": result}
+        return {"ok": False, "error": "evaluate_response 返回 None（详见服务端终端日志）"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/evaluations")
+async def api_evaluations(user_id: int = Depends(get_current_user), limit: int = 50):
+    """查看该用户最近的 AI 回复质量评分（LLM-as-Judge）。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT e.id, e.session_id, e.user_message, e.assistant_reply,
+                      e.empathy, e.naturalness, e.helpfulness, e.safety, e.overall, e.comment, e.created_at
+               FROM evaluations e
+               JOIN sessions s ON s.id = e.session_id
+               WHERE s.user_id = ?
+               ORDER BY e.id DESC LIMIT ?""",
+            (user_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "session_id": r["session_id"],
+                "user_message": r["user_message"],
+                "assistant_reply": r["assistant_reply"],
+                "scores": {
+                    "empathy": r["empathy"],
+                    "naturalness": r["naturalness"],
+                    "helpfulness": r["helpfulness"],
+                    "safety": r["safety"],
+                    "overall": r["overall"],
+                },
+                "comment": r["comment"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+
+@app.get("/api/evaluations/stats")
+async def api_evaluation_stats(user_id: int = Depends(get_current_user)):
+    """返回该用户所有评分的汇总统计（各维度均值、总体均值、评分条数）。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT COUNT(*) as cnt,
+                      ROUND(AVG(e.empathy), 2) as avg_empathy,
+                      ROUND(AVG(e.naturalness), 2) as avg_naturalness,
+                      ROUND(AVG(e.helpfulness), 2) as avg_helpfulness,
+                      ROUND(AVG(e.safety), 2) as avg_safety,
+                      ROUND(AVG(e.overall), 2) as avg_overall,
+                      ROUND(AVG(e.latency_ms), 0) as avg_latency_ms,
+                      ROUND(AVG(e.token_count), 0) as avg_token_count
+               FROM evaluations e
+               JOIN sessions s ON s.id = e.session_id
+               WHERE s.user_id = ?""",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return {
+            "count": row["cnt"],
+            "avg_empathy": row["avg_empathy"],
+            "avg_naturalness": row["avg_naturalness"],
+            "avg_helpfulness": row["avg_helpfulness"],
+            "avg_safety": row["avg_safety"],
+            "avg_overall": row["avg_overall"],
+            "avg_latency_ms": row["avg_latency_ms"],
+            "avg_token_count": row["avg_token_count"],
+        }
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# 个人成长报告
+# ─────────────────────────────────────────────────────────────
+
+_GROWTH_PROMPT = """\
+你是一位温暖、睿智、观察力极强的成长伴侣，正在为"{name}"生成一份个人成长报告。
+你拥有这位用户与树洞日记 AI 的全部对话摘要，以及他/她说过的部分原话。
+
+这位用户对自己要求很严格，常常看不见自己的价值，总觉得自己不够好。
+你的任务：从旁观者视角，真实、具体地告诉他/她——在这段时间里，你观察到了什么。
+
+重要原则：
+- 从数据中找具体证据，绝不空洞地说"你很棒"
+- 语气像一位了解你多年的老朋友：温暖、直接、真实，不煽情
+- 用"你"称呼用户，不用"用户"
+- 聚焦于他/她已经拥有的，不聚焦于缺失的
+- 如果数据不足以支持某结论，不要编造
+
+【对话摘要（时间顺序，共 {n_summaries} 条）】
+{summaries}
+
+【用户说过的部分原话（最近 50 条）】
+{user_messages}
+
+请只输出 JSON，格式如下：
+{{
+  "period_summary": "一句话描述时间跨度，如「从2025年9月到2026年4月，共XX次对话」",
+  "highlights": ["这段时间你经历/做到的具体事（3-5条，要有细节）"],
+  "strengths": [
+    {{"trait": "特质名称（2-4字）", "evidence": "从对话中找到的具体佐证（1-2句）"}}
+  ],
+  "values": ["你反复在意的人或事（2-3条）"],
+  "growing": "你正在努力面对的一件事，用成长视角描述，不是批评（1-2句）",
+  "letter": "亲爱的{name}，\\n\\n（200-300字，温暖且具体，有真实细节，结尾署名：\\n\\n一直在这里的树洞）"
+}}"""
+
+
+async def _generate_growth_report(user_id: int, conn) -> dict:
+    """用全量历史数据生成成长报告，调用主 LLM。"""
+    # 用户名
+    cursor = await conn.execute("SELECT name FROM users WHERE id=?", (user_id,))
+    row = await cursor.fetchone()
+    name = (row["name"] if row else None) or "你"
+
+    # 全量会话摘要
+    cursor = await conn.execute(
+        """SELECT summary, started_at FROM sessions
+           WHERE user_id=? AND summary IS NOT NULL AND summary != ''
+           ORDER BY started_at""",
+        (user_id,),
+    )
+    summaries_rows = await cursor.fetchall()
+    summaries_text = "\n".join(
+        f"[{r['started_at'][:10]}] {r['summary']}" for r in summaries_rows
+    ) or "（暂无摘要）"
+
+    # 最近 50 条用户原话
+    cursor = await conn.execute(
+        """SELECT m.content FROM messages m
+           JOIN sessions s ON s.id = m.session_id
+           WHERE s.user_id=? AND m.role='user'
+           ORDER BY m.id DESC LIMIT 50""",
+        (user_id,),
+    )
+    msg_rows = await cursor.fetchall()
+    user_msgs_text = "\n".join(f"- {r['content'][:200]}" for r in reversed(msg_rows)) or "（暂无）"
+
+    prompt = _GROWTH_PROMPT.format(
+        name=name,
+        n_summaries=len(summaries_rows),
+        summaries=summaries_text[:6000],
+        user_messages=user_msgs_text[:2000],
+    )
+
+    from services.llm import get_client
+    from config import OPENAI_MODEL
+    import re as _re
+    client = get_client()
+    resp = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "只输出 JSON，不要有任何其他文字。"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        max_tokens=2500,
+    )
+    raw = resp.choices[0].message.content or ""
+    raw = raw.strip()
+    raw = _re.sub(r"^```json\s*", "", raw)
+    raw = _re.sub(r"\s*```$", "", raw)
+    data = json.loads(raw)
+    return data
+
+
+@app.get("/api/growth-report/list")
+async def api_growth_report_list(user_id: int = Depends(get_current_user)):
+    """返回该用户所有历史成长报告（按时间倒序）。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT id, month_label, generated_at, report_json FROM growth_reports WHERE user_id=? ORDER BY id DESC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "month_label": r["month_label"],
+                "generated_at": r["generated_at"],
+                "report": json.loads(r["report_json"]),
+            }
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+
+@app.post("/api/growth-report/generate")
+async def api_growth_report_generate(user_id: int = Depends(get_current_user)):
+    """生成本月成长报告。若本月已有则直接返回，不重复生成（除非传 force=true）。"""
+    conn = await get_db()
+    try:
+        current_month = datetime.now().strftime("%Y年%m月")
+        cursor = await conn.execute(
+            "SELECT id, generated_at, report_json FROM growth_reports WHERE user_id=? AND month_label=? ORDER BY id DESC LIMIT 1",
+            (user_id, current_month),
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return {
+                "id": existing["id"],
+                "month_label": current_month,
+                "generated_at": existing["generated_at"],
+                "report": json.loads(existing["report_json"]),
+                "cached": True,
+            }
+
+        report = await _generate_growth_report(user_id, conn)
+        cursor = await conn.execute(
+            "INSERT INTO growth_reports (user_id, month_label, report_json) VALUES (?, ?, ?)",
+            (user_id, current_month, json.dumps(report, ensure_ascii=False)),
+        )
+        await conn.commit()
+        new_id = cursor.lastrowid
+        return {
+            "id": new_id,
+            "month_label": current_month,
+            "generated_at": datetime.now().isoformat(),
+            "report": report,
+            "cached": False,
+        }
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"模型返回格式错误：{e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    finally:
+        await conn.close()
 
 
 if __name__ == "__main__":

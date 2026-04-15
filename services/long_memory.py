@@ -414,6 +414,22 @@ async def extract_and_save_profiles(
     if not s or len(s) < 2:
         return 0, "平静", False
 
+    # 跳过明确无意义的应答词，节省 LLM 调用
+    _TRIVIAL = {
+        "嗯", "嗯嗯", "嗯嗯嗯", "嗯？", "啊", "哦", "哦哦", "哦？",
+        "好", "好的", "好吧", "好啊", "好好", "好了", "行", "行吧", "行的",
+        "知道", "知道了", "知道了哦", "明白", "明白了", "懂了", "懂",
+        "谢谢", "谢", "谢了", "感谢", "多谢",
+        "ok", "okay",
+        "哈哈", "哈哈哈", "哈哈哈哈", "呵呵", "嘻嘻", "哈",
+        "是", "是的", "是啊", "是哦", "对", "对的", "对啊", "对哦",
+        "然后", "然后呢", "继续", "说下去",
+        "没事", "没关系", "不用了", "算了",
+        "?", "？", "...", "……",
+    }
+    if s.lower() in _TRIVIAL:
+        return 0, "平静", False
+
     try:
         from openai import AsyncOpenAI
         from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL

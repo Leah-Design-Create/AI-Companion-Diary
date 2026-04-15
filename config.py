@@ -31,6 +31,19 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 DASHSCOPE_TTS_MODEL = os.getenv("DASHSCOPE_TTS_MODEL", "")
 DASHSCOPE_TTS_VOICE = os.getenv("DASHSCOPE_TTS_VOICE", "")
 
+# 心情画文生图（DashScope 或其他兼容接口）
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "")
+IMAGE_GEN_SIZE = os.getenv("IMAGE_GEN_SIZE", "512*512")
+
+# 评估模型（LLM-as-Judge，默认 DeepSeek，也兼容其他 OpenAI 兼容接口）
+EVAL_API_KEY = os.getenv("EVAL_API_KEY", "")
+EVAL_BASE_URL = os.getenv("EVAL_BASE_URL", "https://api.deepseek.com")
+EVAL_MODEL = os.getenv("EVAL_MODEL", "deepseek-chat")
+
+# 兼容旧版 Gemini 变量名（若有旧 .env 则自动回退）
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
+
 # 应用
 DB_PATH = os.getenv("DB_PATH", "companion.db")
 INACTIVE_DAYS_FOR_REMINDER = int(os.getenv("INACTIVE_DAYS_FOR_REMINDER", "2"))

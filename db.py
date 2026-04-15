@@ -77,6 +77,46 @@ async def init_db():
             created_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
+
+        -- 个人成长报告（每月一份，长久保存）
+        CREATE TABLE IF NOT EXISTS growth_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            month_label TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            generated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        -- 用户对每条 AI 回复的手动反馈（👍/👎）
+        CREATE TABLE IF NOT EXISTS message_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            session_id INTEGER,
+            user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (message_id) REFERENCES messages(id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        -- LLM-as-Judge 回复质量评分日志
+        CREATE TABLE IF NOT EXISTS evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            user_message TEXT,
+            assistant_reply TEXT,
+            empathy INTEGER,
+            naturalness INTEGER,
+            helpfulness INTEGER,
+            safety INTEGER,
+            overall REAL,
+            comment TEXT,
+            latency_ms INTEGER,
+            token_count INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        );
         """)
         await conn.commit()
         # 为旧库补充 auth 列
@@ -114,6 +154,22 @@ async def init_db():
             await conn.commit()
         except Exception:
             pass
+        # 为旧库补充 sessions.mood_image_url（心情画 URL）
+        try:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN mood_image_url TEXT")
+            await conn.commit()
+        except Exception:
+            pass
+        # 为旧库补充 evaluations 性能字段
+        for sql in [
+            "ALTER TABLE evaluations ADD COLUMN latency_ms INTEGER",
+            "ALTER TABLE evaluations ADD COLUMN token_count INTEGER",
+        ]:
+            try:
+                await conn.execute(sql)
+                await conn.commit()
+            except Exception:
+                pass
     finally:
         await conn.close()
 

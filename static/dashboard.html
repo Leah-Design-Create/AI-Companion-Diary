@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数据看板 · 树洞日记</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f4f0; color: #333; min-height: 100vh; }
+    header { background: #fff; border-bottom: 1px solid #e8e4dd; padding: 14px 24px; display: flex; align-items: center; gap: 16px; }
+    header a { color: #888; text-decoration: none; font-size: 0.9rem; }
+    header a:hover { color: #333; }
+    header h1 { font-size: 1.1rem; font-weight: 600; color: #444; }
+    .container { max-width: 960px; margin: 0 auto; padding: 28px 20px; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
+    @media (max-width: 600px) { .cards { grid-template-columns: 1fr; } }
+    .card { background: #fff; border-radius: 12px; padding: 20px 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.07); }
+    .card .label { font-size: 0.8rem; color: #999; margin-bottom: 8px; }
+    .card .value { font-size: 2rem; font-weight: 700; color: #333; }
+    .card .sub { font-size: 0.8rem; color: #aaa; margin-top: 4px; }
+    .chart-wrap { background: #fff; border-radius: 12px; padding: 20px 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.07); margin-bottom: 24px; }
+    .chart-wrap h2 { font-size: 0.95rem; color: #555; margin-bottom: 16px; }
+    .chart-box { position: relative; height: 220px; }
+    .neg-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    .neg-table th { text-align: left; padding: 8px 12px; color: #888; font-weight: 500; border-bottom: 1px solid #eee; }
+    .neg-table td { padding: 10px 12px; border-bottom: 1px solid #f0ede8; vertical-align: top; }
+    .neg-table tr:last-child td { border-bottom: none; }
+    .neg-table .msg-cell { max-width: 260px; color: #555; }
+    .neg-table .reply-cell { max-width: 320px; color: #777; }
+    .neg-table .date-cell { white-space: nowrap; color: #bbb; }
+    .empty { text-align: center; color: #bbb; padding: 40px; }
+    .export-btn { display: inline-block; margin-top: 16px; padding: 7px 16px; background: #f0ede8; border: none; border-radius: 8px; color: #666; font-size: 0.85rem; cursor: pointer; text-decoration: none; }
+    .export-btn:hover { background: #e5e1da; }
+    #loading { text-align: center; padding: 60px; color: #aaa; }
+  </style>
+</head>
+<body>
+<header>
+  <a href="/">← 返回</a>
+  <h1>数据看板</h1>
+</header>
+<div class="container" id="loading">加载中…</div>
+<div class="container" id="main" style="display:none">
+
+  <!-- 统计卡片 -->
+  <div class="cards">
+    <div class="card">
+      <div class="label">平均评分</div>
+      <div class="value" id="avgScore">—</div>
+      <div class="sub">LLM-as-Judge 综合分（满分5）</div>
+    </div>
+    <div class="card">
+      <div class="label">用户好评率</div>
+      <div class="value" id="approvalRate">—</div>
+      <div class="sub" id="feedbackCount">暂无反馈数据</div>
+    </div>
+    <div class="card">
+      <div class="label">反馈总量</div>
+      <div class="value" id="feedbackTotal">—</div>
+      <div class="sub">👍 <span id="upCount">0</span> &nbsp; 👎 <span id="downCount">0</span></div>
+    </div>
+  </div>
+
+  <!-- 评分趋势 -->
+  <div class="chart-wrap">
+    <h2>AI 回复质量趋势（近 30 天）</h2>
+    <div class="chart-box"><canvas id="evalChart"></canvas></div>
+  </div>
+
+  <!-- 反馈趋势 -->
+  <div class="chart-wrap">
+    <h2>用户反馈趋势（近 30 天）</h2>
+    <div class="chart-box"><canvas id="feedbackChart"></canvas></div>
+  </div>
+
+  <!-- 差评列表 -->
+  <div class="chart-wrap">
+    <h2>最近差评对话</h2>
+    <div id="negTable"></div>
+    <a href="/api/feedback/export" class="export-btn" id="exportBtn">导出反馈 CSV</a>
+  </div>
+
+</div>
+
+<script>
+  const token = localStorage.getItem('xb_token') || '';
+  const API = window.location.origin;
+
+  async function load() {
+    try {
+      const r = await fetch(API + '/api/dashboard/stats', {
+        headers: { Authorization: 'Bearer ' + token },
+      });
+      if (!r.ok) {
+        document.getElementById('loading').textContent = r.status === 401 ? '请先登录后访问看板' : '加载失败，请刷新重试';
+        return;
+      }
+      const d = await r.json();
+      render(d);
+    } catch(e) {
+      document.getElementById('loading').textContent = '无法连接服务器';
+    }
+  }
+
+  function render(d) {
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('main').style.display = '';
+
+    // 卡片
+    const evalDays = d.eval_trend || [];
+    if (evalDays.length) {
+      const avg = evalDays.reduce((s, x) => s + x.avg_overall, 0) / evalDays.length;
+      document.getElementById('avgScore').textContent = avg.toFixed(1);
+    }
+    const fb = d.feedback_summary || {};
+    const total = fb.total || 0;
+    const up = fb.up || 0;
+    const down = fb.down || 0;
+    document.getElementById('feedbackTotal').textContent = total;
+    document.getElementById('upCount').textContent = up;
+    document.getElementById('downCount').textContent = down;
+    if (total > 0) {
+      document.getElementById('approvalRate').textContent = Math.round(up / total * 100) + '%';
+      document.getElementById('feedbackCount').textContent = '共 ' + total + ' 条反馈';
+    }
+
+    // 评分折线图
+    const evalLabels = evalDays.map(x => x.date.slice(5));
+    const colors = { empathy: '#e8a87c', naturalness: '#7ec8a8', helpfulness: '#7aa8e0', overall: '#c97b63' };
+    new Chart(document.getElementById('evalChart'), {
+      type: 'line',
+      data: {
+        labels: evalLabels,
+        datasets: [
+          { label: '综合', data: evalDays.map(x => x.avg_overall), borderColor: colors.overall, backgroundColor: 'transparent', tension: 0.3, pointRadius: 3 },
+          { label: '共情', data: evalDays.map(x => x.empathy), borderColor: colors.empathy, backgroundColor: 'transparent', tension: 0.3, pointRadius: 2, borderDash: [4,3] },
+          { label: '自然', data: evalDays.map(x => x.naturalness), borderColor: colors.naturalness, backgroundColor: 'transparent', tension: 0.3, pointRadius: 2, borderDash: [4,3] },
+          { label: '有用', data: evalDays.map(x => x.helpfulness), borderColor: colors.helpfulness, backgroundColor: 'transparent', tension: 0.3, pointRadius: 2, borderDash: [4,3] },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { y: { min: 1, max: 5, ticks: { stepSize: 1 } } },
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
+      },
+    });
+
+    // 反馈堆叠柱状图
+    const fbTrend = d.feedback_trend || [];
+    new Chart(document.getElementById('feedbackChart'), {
+      type: 'bar',
+      data: {
+        labels: fbTrend.map(x => x.date.slice(5)),
+        datasets: [
+          { label: '👍 好评', data: fbTrend.map(x => x.up), backgroundColor: '#7ec8a8' },
+          { label: '👎 差评', data: fbTrend.map(x => x.down), backgroundColor: '#e8817a' },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { x: { stacked: true }, y: { stacked: true, ticks: { stepSize: 1 } } },
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } },
+      },
+    });
+
+    // 差评表格
+    const neg = d.recent_negative || [];
+    const container = document.getElementById('negTable');
+    if (!neg.length) {
+      container.innerHTML = '<div class="empty">暂无差评记录</div>';
+      return;
+    }
+    let html = '<table class="neg-table"><thead><tr><th>用户说</th><th>AI 回复</th><th>时间</th></tr></thead><tbody>';
+    neg.forEach(row => {
+      const userMsg = (row.user_message || '—').slice(0, 80);
+      const reply = (row.assistant_reply || '—').slice(0, 120);
+      const date = (row.created_at || '').slice(0, 16).replace('T', ' ');
+      html += `<tr>
+        <td class="msg-cell">${esc(userMsg)}</td>
+        <td class="reply-cell">${esc(reply)}</td>
+        <td class="date-cell">${esc(date)}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+
+    // 导出链接加上 token（GET 请求无法加 header，改为跳转后让服务端从 cookie 拿；
+    // 如果是 Bearer token 只能用 query param 或用 fetch 下载）
+    const exportBtn = document.getElementById('exportBtn');
+    exportBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const resp = await fetch(API + '/api/feedback/export', { headers: { Authorization: 'Bearer ' + token } });
+      if (!resp.ok) { alert('导出失败'); return; }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'feedback.csv'; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  load();
+</script>
+</body>
+</html>

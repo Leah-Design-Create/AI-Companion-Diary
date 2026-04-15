@@ -61,7 +61,7 @@ def _build_msgs(messages: list[dict], extra_system: str) -> list[dict]:
 async def chat(messages: list[dict], extra_system: str = "") -> str:
     client = get_client()
     msgs = _build_msgs(messages, extra_system)
-    temp = 0.15 if extra_system else 0.8
+    temp = 0.15 if extra_system else 0.9
     r = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=msgs,
@@ -76,34 +76,41 @@ async def chat_with_knowledge(
     extra_system: str = "",
     rag_fn=None,  # async (query: str) -> list[str]
     force_tool: bool = False,
-) -> str:
+) -> tuple[str, int]:
     """带 search_knowledge 工具的对话。
     若模型调用工具，执行 rag_fn 获取结果后二次调用得到最终回复。
     rag_fn 为 None 时退化为普通 chat。
+    返回 (reply, total_tokens)。
     """
     client = get_client()
     msgs = _build_msgs(messages, extra_system)
 
+    _no_think = {"enable_thinking": False}
+
     if rag_fn is None:
         r = await client.chat.completions.create(
-            model=OPENAI_MODEL, messages=msgs, temperature=0.8, max_tokens=1024,
+            model=OPENAI_MODEL, messages=msgs, temperature=0.9, max_tokens=1024,
+            extra_body=_no_think,
         )
-        return (r.choices[0].message.content or "").strip()
+        tokens = r.usage.total_tokens if r.usage else 0
+        return (r.choices[0].message.content or "").strip(), tokens
 
     tc = {"type": "function", "function": {"name": "search_knowledge"}} if force_tool else "auto"
     r = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=msgs,
-        temperature=0.8,
+        temperature=0.9,
         max_tokens=1024,
         tools=[SEARCH_KNOWLEDGE_TOOL],
         tool_choice=tc,
+        extra_body=_no_think,
     )
     msg = r.choices[0].message
+    tokens = r.usage.total_tokens if r.usage else 0
 
     if not msg.tool_calls:
         print(f"[FunctionCall] 模型直接回答（未调用工具）finish_reason={r.choices[0].finish_reason}")
-        return (msg.content or "").strip()
+        return (msg.content or "").strip(), tokens
 
     # 模型决定调用工具
     tool_call = msg.tool_calls[0]
@@ -144,20 +151,23 @@ async def chat_with_knowledge(
         messages=msgs_with_result,
         temperature=0.15,
         max_tokens=1024,
+        extra_body={"enable_thinking": False},
     )
-    return (r2.choices[0].message.content or "").strip()
+    tokens += r2.usage.total_tokens if r2.usage else 0
+    return (r2.choices[0].message.content or "").strip(), tokens
 
 
 async def chat_stream(messages: list[dict], extra_system: str = ""):
     client = get_client()
     msgs = _build_msgs(messages, extra_system)
-    temp = 0.15 if extra_system else 0.8
+    temp = 0.15 if extra_system else 0.9
     stream = await client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=msgs,
         temperature=temp,
         max_tokens=1024,
         stream=True,
+        extra_body={"enable_thinking": False},
     )
     async for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
@@ -189,6 +199,7 @@ async def chat_stream_with_knowledge(
         max_tokens=1024,
         tools=[SEARCH_KNOWLEDGE_TOOL],
         tool_choice=tc,
+        extra_body={"enable_thinking": False},
     )
     msg = r.choices[0].message
 
