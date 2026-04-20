@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """情感陪伴 AI - 主入口：FastAPI + 聊天 / 总结 / RAG / 久未登录提醒"""
+import asyncio
 import base64
 import json
 import os
@@ -1888,14 +1889,17 @@ async def _generate_growth_report(user_id: int, conn) -> dict:
     from config import OPENAI_MODEL
     import re as _re
     client = get_client()
-    resp = await client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "只输出 JSON，不要有任何其他文字。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        max_tokens=2500,
+    resp = await asyncio.wait_for(
+        client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "只输出 JSON，不要有任何其他文字。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=2500,
+        ),
+        timeout=90.0,
     )
     raw = resp.choices[0].message.content or ""
     raw = raw.strip()

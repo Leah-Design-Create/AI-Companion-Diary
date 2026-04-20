@@ -112,7 +112,7 @@ async def generate_mood_image(mood: str, summary: str | None = None) -> str | No
             print(f"[ImageGen] 任务已提交 task_id={task_id}")
 
             poll_headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}"}
-            for _ in range(20):
+            for _ in range(9):
                 await asyncio.sleep(3)
                 pr = await client.get(_API_TASK.format(task_id=task_id), headers=poll_headers)
                 pr.raise_for_status()
