@@ -2,6 +2,7 @@
 """情感陪伴 AI - 主入口：FastAPI + 聊天 / 总结 / RAG / 久未登录提醒"""
 import base64
 import json
+import os
 import re
 import time
 import uuid
