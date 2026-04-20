@@ -1970,18 +1970,6 @@ async def api_growth_report_generate(user_id: int = Depends(get_current_user)):
         await conn.close()
 
 
-ADMIN_UPLOAD_SECRET = os.environ.get("ADMIN_UPLOAD_SECRET", "")
-
-@app.post("/admin/upload-db")
-async def admin_upload_db(secret: str = Query(...), file: UploadFile = File(...)):
-    if not ADMIN_UPLOAD_SECRET or secret != ADMIN_UPLOAD_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
-    db_path = Path(DB_PATH)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    db_path.write_bytes(content)
-    return {"ok": True, "size": len(content)}
-
 
 if __name__ == "__main__":
     import os
