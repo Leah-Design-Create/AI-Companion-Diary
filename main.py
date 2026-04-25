@@ -247,8 +247,9 @@ async def lifespan(app: FastAPI):
     await init_db()
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     key_status = "OK" if (OPENAI_API_KEY or "").strip() else "MISSING"
-    visible_keys = [k for k in os.environ if "OPENAI" in k or "DASHSCOPE" in k or "RAILWAY" in k]
-    print(f"[startup] OPENAI_API_KEY={key_status}, visible env keys: {visible_keys}", flush=True)
+    upload_dir_val = os.getenv("UPLOAD_DIR", "(not set)")
+    db_path_val = os.getenv("DB_PATH", "(not set)")
+    print(f"[startup] OPENAI_API_KEY={key_status} | UPLOAD_DIR={upload_dir_val} | DB_PATH={db_path_val} | UPLOAD_DIR exists={UPLOAD_DIR.exists()}", flush=True)
     yield
     # 关闭时如需清理可在此处理
 
