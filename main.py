@@ -42,7 +42,8 @@ from services.evaluate import evaluate_response
 RAG_STATS = {"total": 0, "hits": 0}
 
 # 用户上传的图片存放目录（对话中分享的图片）
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+# 优先使用环境变量 UPLOAD_DIR（Railway 上设为 Volume 路径以持久化）
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(Path(__file__).resolve().parent / "uploads")))
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 
