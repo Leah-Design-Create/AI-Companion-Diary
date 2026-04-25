@@ -3176,10 +3176,14 @@
       const loading = document.getElementById('reportLoading');
       const content = document.getElementById('reportContent');
       loading.style.display = 'block';
+      loading.textContent = '加载中…';
       content.style.display = 'none';
 
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 70000);
       try {
-        const r = await apiFetch(`/api/report/weekly?week_offset=${reportWeekOffset}`);
+        const r = await apiFetch(`/api/report/weekly?week_offset=${reportWeekOffset}`, { signal: controller.signal });
+        clearTimeout(timer);
         const data = await r.json();
 
         // Week label
@@ -3224,7 +3228,8 @@
         // Disable next button if at current week
         document.getElementById('reportNext').disabled = reportWeekOffset >= 0;
       } catch (e) {
-        loading.textContent = '加载失败，请稍后再试。';
+        clearTimeout(timer);
+        loading.textContent = e.name === 'AbortError' ? '加载超时，请稍后再试。' : '加载失败，请稍后再试。';
       }
     }
 

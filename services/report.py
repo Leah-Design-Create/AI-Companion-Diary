@@ -2,6 +2,7 @@
 """情绪周报：聚合一周情绪数据，生成高光时刻与成长建议。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import date, timedelta
@@ -176,7 +177,10 @@ async def get_weekly_report(user_id: int, week_offset: int = 0) -> dict:
 只输出 JSON，格式：{{"highlights": "...", "suggestions": "...", "keywords": ["词1", "词2", ...]}}"""
 
         try:
-            raw = await chat([{"role": "user", "content": prompt}], extra_system="只输出 JSON，不要有任何其他文字。")
+            raw = await asyncio.wait_for(
+                chat([{"role": "user", "content": prompt}], extra_system="只输出 JSON，不要有任何其他文字。"),
+                timeout=60.0,
+            )
             raw = raw.strip()
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
