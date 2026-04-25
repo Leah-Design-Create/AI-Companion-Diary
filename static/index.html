@@ -3040,21 +3040,28 @@
       document.getElementById('btnGrowthTab').classList.toggle('active', !isWeekly);
       document.getElementById('weeklyReportView').style.display = isWeekly ? '' : 'none';
       document.getElementById('growthReportView').style.display = isWeekly ? 'none' : '';
+      document.getElementById('reportPanel').scrollTop = 0;
       if (!isWeekly && _growthReports.length === 0) loadGrowthReports();
     }
 
     async function loadGrowthReports() {
       try {
+        console.log('[growth] loading list...');
         const r = await apiFetch('/api/growth-report/list');
         _growthReports = await r.json();
+        console.log('[growth] list loaded, count=', _growthReports.length);
         renderGrowthHistoryPills();
         if (_growthReports.length > 0) {
           renderGrowthReport(_growthReports[0]);
+          console.log('[growth] rendered first report');
         } else {
           document.getElementById('growthEmpty').style.display = '';
           document.getElementById('growthReportContent').style.display = 'none';
+          console.log('[growth] no reports, showing empty');
         }
-      } catch (_) {}
+      } catch (e) {
+        console.error('[growth] error:', e);
+      }
     }
 
     function renderGrowthHistoryPills() {
