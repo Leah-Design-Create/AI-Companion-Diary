@@ -1563,8 +1563,14 @@ async def api_weather(lat: float, lon: float):
 @app.get("/api/report/weekly")
 async def api_weekly_report(user_id: int = Depends(get_current_user), week_offset: int = 0):
     """获取情绪周报。week_offset=0 为本周，-1 为上周，以此类推。"""
-    data = await get_weekly_report(user_id, week_offset)
-    return data
+    print(f"[report] start user={user_id} week_offset={week_offset}", flush=True)
+    try:
+        data = await get_weekly_report(user_id, week_offset)
+        print(f"[report] done", flush=True)
+        return data
+    except Exception as e:
+        print(f"[report] error: {e}", flush=True)
+        raise
 
 
 class FeedbackRequest(BaseModel):
