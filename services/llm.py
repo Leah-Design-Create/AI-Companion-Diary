@@ -67,6 +67,7 @@ async def chat(messages: list[dict], extra_system: str = "") -> str:
         messages=msgs,
         temperature=temp,
         max_tokens=1024,
+        extra_body={"enable_thinking": False},
     )
     return (r.choices[0].message.content or "").strip()
 
