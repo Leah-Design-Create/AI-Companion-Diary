@@ -245,6 +245,8 @@ class RenameSessionRequest(BaseModel):
 async def lifespan(app: FastAPI):
     await init_db()
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    key_status = "OK" if (OPENAI_API_KEY or "").strip() else "MISSING"
+    print(f"[startup] OPENAI_API_KEY={key_status}", flush=True)
     yield
     # 关闭时如需清理可在此处理
 
