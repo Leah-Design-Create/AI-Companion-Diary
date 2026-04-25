@@ -3037,11 +3037,15 @@
 
     function showReportTab(tab) {
       const isWeekly = tab === 'weekly';
+      const weeklyView = document.getElementById('weeklyReportView');
+      const growthView = document.getElementById('growthReportView');
       document.getElementById('btnWeeklyTab').classList.toggle('active', isWeekly);
       document.getElementById('btnGrowthTab').classList.toggle('active', !isWeekly);
-      document.getElementById('weeklyReportView').style.display = isWeekly ? '' : 'none';
-      document.getElementById('growthReportView').style.display = isWeekly ? 'none' : '';
-      document.getElementById('reportPanel').scrollTop = 0;
+      weeklyView.style.display = isWeekly ? '' : 'none';
+      growthView.style.display = isWeekly ? 'none' : '';
+      // 两个 tab 都是独立滚动容器，切换时重置其滚动位置，避免出现大面积空白。
+      weeklyView.scrollTop = 0;
+      growthView.scrollTop = 0;
       if (!isWeekly && _growthReports.length === 0) loadGrowthReports();
     }
 
