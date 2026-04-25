@@ -592,7 +592,8 @@
     .empty-state { text-align: center; padding: 60px 20px; color: var(--ink-muted); }
 
     /* ===== 情绪周报 ===== */
-    #reportPanel { overflow-y: auto; padding: 32px 28px 56px; -webkit-overflow-scrolling: touch; background: var(--bg-warm); }
+    #reportPanel { overflow: hidden; background: var(--bg-warm); display: flex; flex-direction: column; }
+    #weeklyReportView, #growthReportView { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0; padding: 32px 28px 56px; }
     .report-inner { max-width: 720px; margin: 0 auto; }
 
     /* 顶部 Hero */
@@ -867,8 +868,8 @@
       }
       /* 日记内容在移动端不再需要内部滚动，由外层 panel 统一滚动 */
       .diary-content { overflow-y: visible; }
-      #reportPanel {
-        overflow-y: auto; -webkit-overflow-scrolling: touch;
+      #reportPanel { overflow: hidden; }
+      #weeklyReportView, #growthReportView {
         padding: 0 0 calc(56px + env(safe-area-inset-bottom, 0px) + 16px);
       }
       .report-inner { padding: 16px 14px 0; }
