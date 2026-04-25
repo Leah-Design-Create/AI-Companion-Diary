@@ -1633,6 +1633,7 @@
       if (panelId !== 'chatPanel' && sessionId) {
         endSessionAndSummarize().then(() => {
           if (panelId === 'notesPanel') loadSummaries();
+          if (panelId === 'reportPanel') loadWeeklyReport();
         });
         return; // 等 endSession 完成后再加载
       }
