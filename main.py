@@ -1019,20 +1019,28 @@ async def api_end_session(req: EndSessionRequest):
             messages.append({"role": r["role"], "content": content})
         if not messages:
             return {"session_id": req.session_id, "summary": None, "anxiety_detected": False}
+        print(f"[session/end] session={req.session_id} messages={len(messages)}", flush=True)
         anxiety = await analyze_anxiety(messages)
+        print(f"[session/end] anxiety done", flush=True)
         summary = await generate_summary(messages)
+        print(f"[session/end] summary done", flush=True)
         mood = "平静"
         try:
             mood = await analyze_mood(messages) or "平静"
         except Exception:
             pass
+        print(f"[session/end] mood={mood}", flush=True)
         mood_image_url = await generate_mood_image(mood, summary)
+        print(f"[session/end] image done url={mood_image_url}", flush=True)
         await conn.execute(
             "UPDATE sessions SET ended_at = datetime('now'), summary = ?, anxiety_detected = ?, mood = ?, mood_image_url = ? WHERE id = ?",
             (summary, 1 if anxiety else 0, mood, mood_image_url, req.session_id),
         )
         await conn.commit()
         return {"session_id": req.session_id, "summary": summary, "anxiety_detected": anxiety, "mood": mood, "mood_image_url": mood_image_url}
+    except Exception as e:
+        print(f"[session/end] ERROR: {e}", flush=True)
+        raise
     finally:
         await conn.close()
 

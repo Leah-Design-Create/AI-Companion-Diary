@@ -6,10 +6,11 @@ from pathlib import Path
 
 import httpx
 
+import os
 from config import DASHSCOPE_API_KEY, IMAGE_GEN_MODEL, IMAGE_GEN_SIZE
 
-UPLOADS_DIR = Path("uploads")
-UPLOADS_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR = Path(os.getenv("UPLOAD_DIR", str(Path(__file__).resolve().parent.parent / "uploads")))
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 _API_SUBMIT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis"
 _API_TASK   = "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
