@@ -19,6 +19,7 @@ def _recognize_sync(audio_path: str, fmt: str) -> str:
         model='paraformer-realtime-v2',
         format=fmt,
         sample_rate=16000,
+        callback=None,
     ).call(audio_path)
     if getattr(resp, 'status_code', None) != 200:
         code = getattr(resp, 'status_code', '?')
