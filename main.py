@@ -33,6 +33,7 @@ from services.summary import generate_summary
 from services.image_gen import generate_mood_image
 from services.reminder import get_reminder_if_inactive
 from services.tts import synthesize_to_mp3
+from services.stt import transcribe_audio
 from services.long_memory import add_turn_to_memory, retrieve_relevant_memories, extract_and_save_profiles
 from services.report import get_weekly_report
 from services.weather import get_weather
@@ -380,6 +381,14 @@ async def api_tts(req: TTSRequest):
     """文本转语音：调用 DashScope qwen3-tts-flash，返回 mp3 音频。"""
     audio_bytes = await synthesize_to_mp3(req.text)
     return Response(content=audio_bytes, media_type="audio/wav")
+
+
+@app.post("/api/stt")
+async def api_stt(file: UploadFile):
+    """语音转文字：接收音频文件，调用 DashScope Paraformer 返回文字。"""
+    audio_bytes = await file.read()
+    text = await transcribe_audio(audio_bytes, file.filename or "audio.webm")
+    return {"text": text}
 
 
 # ---------- 对话 ----------

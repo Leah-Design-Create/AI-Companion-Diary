@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>树洞日记</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌳</text></svg>" />
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;700&family=Noto+Sans+SC:wght@300;400;500&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.loli.net">
+  <link rel="preconnect" href="https://gstatic.loli.net" crossorigin>
+  <link href="https://fonts.loli.net/css2?family=Noto+Serif+SC:wght@400;500;700&family=Noto+Sans+SC:wght@300;400;500&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg-warm: #FAF7F2;
@@ -2177,6 +2177,30 @@
 
     let _currentAudio = null;
 
+    // iOS 兼容音频播放：AudioContext 在用户手势时解锁后，异步 fetch 结束仍可播放
+    let _ttsCtx = null;
+    function _ensureTTSCtx() {
+      if (!_ttsCtx || _ttsCtx.state === 'closed') _ttsCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (_ttsCtx.state === 'suspended') _ttsCtx.resume();
+      return _ttsCtx;
+    }
+    async function _playAudioBuf(arrayBuf) {
+      const ctx = _ensureTTSCtx();
+      const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
+      const src = ctx.createBufferSource();
+      src.buffer = decoded;
+      src.connect(ctx.destination);
+      let _done = false;
+      const fake = {
+        get paused() { return _done; },
+        onended: null,
+        pause() { _done = true; try { src.stop(); } catch(_) {} },
+      };
+      src.onended = () => { _done = true; if (fake.onended) fake.onended(); };
+      src.start(0);
+      return fake;
+    }
+
     function cleanForTTS(text) {
       return text
         .replace(/\*\*(.+?)\*\*/g, '$1')
@@ -2197,6 +2221,7 @@
       }
       if (!text) return;
       if (btn) { btn.textContent = '…'; btn.disabled = true; }
+      _ensureTTSCtx(); // 用户点击时解锁 iOS 音频
       try {
         const r = await fetch(`${API_BASE}/api/tts`, {
           method: 'POST',
@@ -2204,14 +2229,9 @@
           body: JSON.stringify({ text: cleanForTTS(text) }),
         });
         if (!r.ok) throw new Error('TTS 请求失败');
-        const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        _currentAudio = new Audio(url);
-        _currentAudio.onended = () => {
-          if (btn) btn.textContent = '朗读';
-          URL.revokeObjectURL(url);
-        };
-        _currentAudio.play();
+        const arrayBuf = await r.arrayBuffer();
+        _currentAudio = await _playAudioBuf(arrayBuf);
+        _currentAudio.onended = () => { if (btn) btn.textContent = '朗读'; };
         if (btn) { btn.textContent = '停止'; btn.disabled = false; }
       } catch (e) {
         if (btn) { btn.textContent = '朗读'; btn.disabled = false; }
@@ -2221,9 +2241,9 @@
     // ===== 语音通话 =====
     const CALL = { IDLE: 'idle', LISTENING: 'listening', PROCESSING: 'processing', SPEAKING: 'speaking' };
     let callState = CALL.IDLE;
-    let callRecognition = null;
     let callSilenceTimer = null;
-    let callLang = 'zh-CN'; // 默认中文
+    let callLang = 'zh-CN';
+    let _pttStream = null, _pttRecorder = null, _pttChunks = [];
 
     function toggleCallLang() {
       callLang = callLang === 'zh-CN' ? 'en-US' : 'zh-CN';
@@ -2234,13 +2254,12 @@
       }
     }
 
-    const _SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
     function startCall() {
-      if (!_SpeechRecognition) {
-        alert('当前浏览器不支持语音识别，推荐使用 Chrome 或 Edge。');
+      if (!navigator.mediaDevices || !window.MediaRecorder) {
+        alert('当前浏览器不支持录音，请使用 Chrome、Edge 或 Safari。');
         return;
       }
+      _ensureTTSCtx(); // 用户手势时解锁 iOS 音频
       switchPanel('chatPanel');
       document.getElementById('callOverlay').classList.add('show');
       callSetState(CALL.IDLE);
@@ -2249,8 +2268,10 @@
     function endCall() {
       callState = CALL.IDLE;
       clearTimeout(callSilenceTimer);
-      if (callRecognition) { try { callRecognition.abort(); } catch(_){} callRecognition = null; }
-      speechSynthesis.cancel();
+      if (_pttRecorder && _pttRecorder.state !== 'inactive') { try { _pttRecorder.stop(); } catch(_) {} }
+      _pttRecorder = null;
+      if (_pttStream) { _pttStream.getTracks().forEach(t => t.stop()); _pttStream = null; }
+      if (_currentAudio && !_currentAudio.paused) _currentAudio.pause();
       const overlay = document.getElementById('callOverlay');
       overlay.classList.remove('show', 'listening', 'processing', 'speaking');
     }
@@ -2288,30 +2309,6 @@
     // 语音情绪分析：采集录音期间的音量样本
     let _voiceAnalyser = null, _voiceStream = null, _voiceSamples = [], _voiceStartTime = 0;
 
-    async function startVoiceAnalysis() {
-      try {
-        _voiceSamples = [];
-        _voiceStartTime = Date.now();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        _voiceStream = stream;
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        src.connect(analyser);
-        _voiceAnalyser = analyser;
-        const buf = new Float32Array(analyser.fftSize);
-        function sample() {
-          if (!_voiceAnalyser) return;
-          analyser.getFloatTimeDomainData(buf);
-          let sum = 0;
-          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-          _voiceSamples.push(Math.sqrt(sum / buf.length));
-          setTimeout(sample, 100);
-        }
-        sample();
-      } catch(_) {}
-    }
 
     function stopVoiceAnalysis(textLength) {
       _voiceAnalyser = null;
@@ -2330,72 +2327,74 @@
     }
 
     // PTT：按下开始录音
-    function callPttStart() {
+    // PTT：按下开始录音（MediaRecorder，不依赖 Google Speech API）
+    async function callPttStart() {
       if (callState !== CALL.IDLE) return;
       callSetState(CALL.LISTENING);
-      document.getElementById('callTranscript').textContent = '';
-      startVoiceAnalysis();
-
-      let accumulated = ''; // 跨识别轮次保留的文字
-
-      function spawnRec() {
-        const rec = new _SpeechRecognition();
-        rec.lang = callLang;
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.maxAlternatives = 1;
-        let sessionFinal = '';
-
-        rec.onresult = (e) => {
-          if (callState !== CALL.LISTENING) return;
-          let interim = '';
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const t = e.results[i][0].transcript;
-            if (e.results[i].isFinal) sessionFinal += t;
-            else interim += t;
-          }
-          document.getElementById('callTranscript').textContent = accumulated + sessionFinal + interim;
-          callRecognition._fullText = accumulated + sessionFinal;
-        };
-        rec.onerror = () => {};
-        rec.onend = () => {
-          accumulated += sessionFinal;
-          // 用户还按着 PTT：新建对象重启，保留已累积的文字
-          if (callState === CALL.LISTENING && callRecognition === rec) {
-            callRecognition = spawnRec();
-          } else {
-            if (callRecognition === rec) callRecognition = null;
-          }
-        };
-        try { rec.start(); } catch(_) {}
-        return rec;
+      document.getElementById('callTranscript').textContent = '录音中…';
+      _ensureTTSCtx(); // 用户手势时解锁 iOS 音频
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        _pttStream = stream;
+        // 音量分析（复用 TTS AudioContext）
+        _voiceSamples = [];
+        _voiceStartTime = Date.now();
+        const actx = _ensureTTSCtx();
+        const msrc = actx.createMediaStreamSource(stream);
+        const analyser = actx.createAnalyser();
+        analyser.fftSize = 256;
+        msrc.connect(analyser);
+        _voiceAnalyser = analyser;
+        const buf = new Float32Array(analyser.fftSize);
+        (function tick() {
+          if (!_voiceAnalyser) return;
+          analyser.getFloatTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+          _voiceSamples.push(Math.sqrt(sum / buf.length));
+          setTimeout(tick, 100);
+        })();
+        // 录音
+        const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+        _pttChunks = [];
+        _pttRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+        _pttRecorder.ondataavailable = e => { if (e.data.size > 0) _pttChunks.push(e.data); };
+        _pttRecorder.start();
+      } catch(e) {
+        callSetState(CALL.IDLE);
       }
-
-      callRecognition = spawnRec();
     }
 
-    // PTT：松开停止录音并发送
+    // PTT：松开停止录音，上传 DashScope STT 识别
     function callPttEnd() {
-      if (callState !== CALL.LISTENING) return;
-      const rec = callRecognition;
-      callRecognition = null;
-      if (!rec) { callSetState(CALL.IDLE); return; }
-
-      // 覆盖 onend：等浏览器把最后的 interim 都 finalize 后再取文字发送
-      rec.onend = () => {
-        const text = (rec._fullText || document.getElementById('callTranscript').textContent || '').trim();
-        const voiceHint = stopVoiceAnalysis(text.length);
-        console.log('[VoiceHint]', voiceHint, '| samples:', _voiceSamples.length);
-        if (text) {
-          callSend(text, voiceHint);
-        } else {
-          callSetState(CALL.IDLE);
-        }
+      if (callState !== CALL.LISTENING || !_pttRecorder) { callSetState(CALL.IDLE); return; }
+      _voiceAnalyser = null;
+      const savedSamples = _voiceSamples.slice();
+      const savedStartTime = _voiceStartTime;
+      _pttRecorder.onstop = async () => {
+        if (_pttStream) { _pttStream.getTracks().forEach(t => t.stop()); _pttStream = null; }
+        const blob = new Blob(_pttChunks, { type: _pttRecorder.mimeType });
+        if (blob.size < 500) { callSetState(CALL.IDLE); return; }
+        document.getElementById('callTranscript').textContent = '识别中…';
+        const ext = (_pttRecorder.mimeType || 'audio/webm').split('/')[1].split(';')[0];
+        const fd = new FormData();
+        fd.append('file', blob, `audio.${ext}`);
+        try {
+          const r = await apiFetch('/api/stt', { method: 'POST', body: fd });
+          const d = r.ok ? await r.json() : {};
+          const text = (d.text || '').trim();
+          document.getElementById('callTranscript').textContent = text;
+          _voiceSamples = savedSamples;
+          _voiceStartTime = savedStartTime;
+          const voiceHint = stopVoiceAnalysis(text.length);
+          if (text) callSend(text, voiceHint);
+          else callSetState(CALL.IDLE);
+        } catch(_) { callSetState(CALL.IDLE); }
       };
-      try { rec.stop(); } catch(_) { callSetState(CALL.IDLE); }
+      try { _pttRecorder.stop(); } catch(_) { callSetState(CALL.IDLE); }
     }
 
-    // 播放一段 TTS 音频，等播放结束后 resolve
+    // 播放一段 TTS 音频，等播放结束后 resolve（AudioContext 兼容 iOS）
     function playTTSAudio(text) {
       return new Promise(async (resolve) => {
         if (callState === CALL.IDLE) { resolve(); return; }
@@ -2406,22 +2405,19 @@
             body: JSON.stringify({ text: text.trim() }),
           });
           if (!r.ok || callState === CALL.IDLE) { resolve(); return; }
-          const blob = await r.blob();
-          const url = URL.createObjectURL(blob);
-          const audio = new Audio(url);
-          _currentAudio = audio;
-          const done = () => { URL.revokeObjectURL(url); _currentAudio = null; resolve(); };
-          audio.onended = done;
-          audio.onerror = done;
-          audio.play().catch(done);
+          const arrayBuf = await r.arrayBuffer();
+          if (callState === CALL.IDLE) { resolve(); return; }
+          const fake = await _playAudioBuf(arrayBuf);
+          _currentAudio = fake;
+          fake.onended = resolve;
         } catch(_) { resolve(); }
       });
     }
 
     async function callSend(text, voiceHint) {
       if (callState === CALL.IDLE) return;
-      // 中断残留的识别
-      if (callRecognition) { try { callRecognition.abort(); } catch(_){} callRecognition = null; }
+      // 中断残留的录音
+      if (_pttRecorder && _pttRecorder.state !== 'inactive') { try { _pttRecorder.stop(); } catch(_) {} _pttRecorder = null; }
       // 中断残留的音频
       if (_currentAudio) { _currentAudio.pause(); _currentAudio = null; }
 
@@ -2523,15 +2519,15 @@
           try {
             const r2 = await currentFetch;
             if (r2.ok && callState !== CALL.IDLE) {
-              const blob = await r2.blob();
-              const url = URL.createObjectURL(blob);
-              const audio = new Audio(url);
-              _currentAudio = audio;
-              await new Promise(res => {
-                const done = () => { URL.revokeObjectURL(url); _currentAudio = null; res(); };
-                audio.onended = done; audio.onerror = done;
-                audio.play().catch(done);
-              });
+              const arrayBuf = await r2.arrayBuffer();
+              if (callState !== CALL.IDLE) {
+                const fake = await _playAudioBuf(arrayBuf);
+                _currentAudio = fake;
+                await new Promise(res => {
+                  fake.onended = res;
+                  if (callState === CALL.IDLE) { fake.pause(); res(); }
+                });
+              }
             }
           } catch(_) {}
         }
@@ -2732,20 +2728,45 @@
     (function initVoiceInput() {
       const micBtn = document.getElementById('micBtn');
       const input = document.getElementById('input');
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) {
+      if (!navigator.mediaDevices || !window.MediaRecorder) {
         if (micBtn) micBtn.title = '当前浏览器不支持语音输入';
         return;
       }
-      const recognition = new SpeechRecognition();
-      recognition.lang = 'zh-CN';
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.onstart = () => { if (micBtn) { micBtn.classList.add('recording'); micBtn.title = '正在听…'; } };
-      recognition.onend = () => { if (micBtn) { micBtn.classList.remove('recording'); micBtn.title = '语音输入'; } };
-      recognition.onresult = (e) => { const t = e.results[0][0].transcript; if (t && input) { input.value = (input.value + t).trim(); sendMessage(); } };
-      recognition.onerror = () => { if (micBtn) micBtn.classList.remove('recording'); };
-      if (micBtn) micBtn.addEventListener('click', () => { if (micBtn.classList.contains('recording')) { recognition.stop(); return; } recognition.start(); });
+      let micRecorder = null, micChunks = [];
+      async function startMicRecording() {
+        try {
+          _ensureTTSCtx();
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+          micChunks = [];
+          micRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+          micRecorder.ondataavailable = e => { if (e.data.size > 0) micChunks.push(e.data); };
+          micRecorder.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop());
+            if (micBtn) { micBtn.classList.remove('recording'); micBtn.title = '语音输入'; }
+            const blob = new Blob(micChunks, { type: micRecorder.mimeType });
+            if (blob.size < 500) return;
+            const ext = (micRecorder.mimeType || 'audio/webm').split('/')[1].split(';')[0];
+            const fd = new FormData();
+            fd.append('file', blob, `audio.${ext}`);
+            try {
+              const r = await apiFetch('/api/stt', { method: 'POST', body: fd });
+              if (r.ok) {
+                const d = await r.json();
+                if (d.text && input) { input.value = (input.value + d.text).trim(); sendMessage(); }
+              }
+            } catch(_) {}
+          };
+          micRecorder.start();
+          if (micBtn) { micBtn.classList.add('recording'); micBtn.title = '正在听…'; }
+        } catch(e) {
+          if (micBtn) micBtn.classList.remove('recording');
+        }
+      }
+      if (micBtn) micBtn.addEventListener('click', () => {
+        if (micRecorder && micRecorder.state === 'recording') { micRecorder.stop(); }
+        else { startMicRecording(); }
+      });
     })();
 
     document.getElementById('sendBtn').addEventListener('click', sendMessage);
