@@ -10,7 +10,8 @@ from fastapi import HTTPException
 from config import DASHSCOPE_API_KEY, OPENAI_API_KEY
 
 _stt_sem = asyncio.Semaphore(2)
-_SUPPORTED_FMTS = {'pcm', 'wav', 'mp3', 'mp4', 'm4a', 'ogg', 'webm', 'opus', 'amr'}
+# DashScope Paraformer 实际支持的格式（不含 webm）
+_DASHSCOPE_FMTS = {'pcm', 'wav', 'mp3', 'mp4', 'm4a', 'aac', 'amr', 'opus', 'ogg', 'speex'}
 
 
 def _recognize_sync(audio_path: str, fmt: str) -> str:
@@ -39,8 +40,11 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
         raise HTTPException(status_code=503, detail="未配置 DASHSCOPE_API_KEY")
 
     dashscope.api_key = api_key
-    ext = (filename.rsplit('.', 1)[-1] if '.' in filename else 'webm').lower()
-    fmt = ext if ext in _SUPPORTED_FMTS else 'webm'
+    ext = (filename.rsplit('.', 1)[-1] if '.' in filename else 'mp4').lower()
+    if ext not in _DASHSCOPE_FMTS:
+        print(f"[STT] 不支持的格式 {ext}，跳过识别", flush=True)
+        return ""
+    fmt = ext
 
     tmp_path = None
     try:

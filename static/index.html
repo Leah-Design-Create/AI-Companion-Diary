@@ -2355,7 +2355,7 @@
           setTimeout(tick, 100);
         })();
         // 录音
-        const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+        const mime = ['audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
         _pttChunks = [];
         _pttRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
         _pttRecorder.ondataavailable = e => { if (e.data.size > 0) _pttChunks.push(e.data); };
@@ -2737,7 +2737,7 @@
         try {
           _ensureTTSCtx();
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          const mime = ['audio/webm', 'audio/mp4', 'audio/ogg'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+          const mime = ['audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
           micChunks = [];
           micRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
           micRecorder.ondataavailable = e => { if (e.data.size > 0) micChunks.push(e.data); };
