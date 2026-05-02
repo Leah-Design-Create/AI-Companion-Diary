@@ -2518,18 +2518,22 @@
           if (i + 1 < validSentences.length) nextFetch = fetchTTS(validSentences[i + 1]);
           try {
             const r2 = await currentFetch;
+            console.log('[TTS] fetch status', r2.status, 'callState', callState);
             if (r2.ok && callState !== CALL.IDLE) {
               const arrayBuf = await r2.arrayBuffer();
+              console.log('[TTS] arrayBuf size', arrayBuf.byteLength);
               if (callState !== CALL.IDLE) {
                 const fake = await _playAudioBuf(arrayBuf);
+                console.log('[TTS] playing...');
                 _currentAudio = fake;
                 await new Promise(res => {
                   fake.onended = res;
                   if (callState === CALL.IDLE) { fake.pause(); res(); }
                 });
+                console.log('[TTS] done');
               }
             }
-          } catch(_) {}
+          } catch(e) { console.error('[TTS] 播放失败', e); }
         }
 
         if (callState !== CALL.IDLE) callSetState(CALL.IDLE);
