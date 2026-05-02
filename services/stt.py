@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""DashScope Paraformer 语音识别封装"""
+"""DashScope Paraformer 语音识别封装（ffmpeg 转码 → WAV → Paraformer）"""
 import asyncio
 import os
+import subprocess
 import tempfile
 
 import dashscope
@@ -10,18 +11,29 @@ from fastapi import HTTPException
 from config import DASHSCOPE_API_KEY, OPENAI_API_KEY
 
 _stt_sem = asyncio.Semaphore(2)
-# DashScope Paraformer 实际支持的格式（不含 webm）
-_DASHSCOPE_FMTS = {'pcm', 'wav', 'mp3', 'mp4', 'm4a', 'aac', 'amr', 'opus', 'ogg', 'speex'}
 
 
-def _recognize_sync(audio_path: str, fmt: str) -> str:
+def _to_wav(audio_bytes: bytes) -> bytes:
+    """用 ffmpeg 把任意格式音频转为 16kHz mono WAV"""
+    proc = subprocess.run(
+        ['ffmpeg', '-y', '-i', 'pipe:0', '-ar', '16000', '-ac', '1', '-f', 'wav', 'pipe:1'],
+        input=audio_bytes,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode(errors='ignore')[:300])
+    return proc.stdout
+
+
+def _recognize_sync(wav_path: str) -> str:
     from dashscope.audio.asr import Recognition
     resp = Recognition(
         model='paraformer-realtime-v2',
-        format=fmt,
+        format='wav',
         sample_rate=16000,
         callback=None,
-    ).call(audio_path)
+    ).call(wav_path)
     if getattr(resp, 'status_code', None) != 200:
         code = getattr(resp, 'status_code', '?')
         msg = getattr(resp, 'message', '') or getattr(resp, 'code', '') or str(resp)
@@ -40,21 +52,22 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
         raise HTTPException(status_code=503, detail="未配置 DASHSCOPE_API_KEY")
 
     dashscope.api_key = api_key
-    ext = (filename.rsplit('.', 1)[-1] if '.' in filename else 'mp4').lower()
-    if ext not in _DASHSCOPE_FMTS:
-        print(f"[STT] 不支持的格式 {ext}，跳过识别", flush=True)
-        return ""
-    fmt = ext
+    loop = asyncio.get_event_loop()
+
+    try:
+        wav_bytes = await loop.run_in_executor(None, _to_wav, audio_bytes)
+    except Exception as e:
+        print(f"[STT] 音频转换失败: {e}", flush=True)
+        raise HTTPException(status_code=400, detail=f"音频格式转换失败: {e}")
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=f'.{fmt}', delete=False) as f:
-            f.write(audio_bytes)
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            f.write(wav_bytes)
             tmp_path = f.name
 
-        loop = asyncio.get_event_loop()
         async with _stt_sem:
-            text = await loop.run_in_executor(None, _recognize_sync, tmp_path, fmt)
+            text = await loop.run_in_executor(None, _recognize_sync, tmp_path)
         return text
     except HTTPException:
         raise
