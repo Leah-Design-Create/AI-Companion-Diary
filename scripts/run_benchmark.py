@@ -19,10 +19,14 @@ import requests
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 绕过系统代理（Windows 注册表代理会干扰本地请求）
+_SESSION = requests.Session()
+_SESSION.trust_env = False
+
 # ───────────────────────────── 认证 ─────────────────────────────
 
 def get_token(base_url, email, password):
-    r = requests.post(f"{base_url}/api/auth/login",
+    r = _SESSION.post(f"{base_url}/api/auth/login",
                       json={"email": email, "password": password}, timeout=15)
     r.raise_for_status()
     return r.json()["token"]
@@ -45,7 +49,7 @@ def run_case(base_url, token, case):
 
     # 1. 拿 AI 回复
     try:
-        r = requests.post(
+        r = _SESSION.post(
             f"{base_url}/api/chat",
             json={"message": case["user_message"]},
             headers=headers,

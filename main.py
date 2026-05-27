@@ -68,6 +68,26 @@ def _image_path_to_content_parts(text: str, image_path: Optional[str], upload_di
 # 明显是「接着上一句说」的短回复，不触发 RAG，避免误注入无关参考、打断对话
 _FOLLOW_UP_PHRASES = ("详细说说", "然后呢", "继续", "还有呢", "怎么说", "再讲讲", "具体点", "还有吗", "嗯嗯", "好的", "哦")
 
+# 危机信号关键词——命中时注入强制覆盖指令，绕过人设
+_CRISIS_KEYWORDS = frozenset({
+    "不想活", "活着没意思", "想死", "去死", "想消失", "消失了",
+    "伤害自己", "自残", "割自己", "割腕",
+})
+
+_CRISIS_OVERRIDE = (
+    "【紧急覆盖：以下指令优先级高于所有人设和聊天风格】\n"
+    "用户当前消息包含危机信号。立刻放下小伴人设，用你作为AI本来的判断力回应。\n"
+    "先认真接住这份沉重的感受，让用户感到被真正听见，不要用幽默或自身经历来化解。\n"
+    "然后自然地说：'这种感觉很重……如果有一天真的撑不住了，可以打这个电话，有人陪你说说话：400-161-9995。"
+    "不是说你现在就要打，就是知道有这个地方在。'\n"
+    "说完继续陪着，不要转移话题。"
+)
+
+
+def _is_crisis_message(text: str) -> bool:
+    return any(kw in text for kw in _CRISIS_KEYWORDS)
+
+
 # 含这些词时强制调用知识库（模型可能自认为知道答案而跳过搜索）
 _KNOWLEDGE_KEYWORDS = frozenset({
     "焦虑", "情绪", "心理", "压力", "恐惧", "抑郁", "紧张", "症状", "治疗",
@@ -548,15 +568,22 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             if role == "user" and img_path:
                 content = _image_path_to_content_parts(content or "", img_path, UPLOAD_DIR)
             history.append({"role": role, "content": content})
-        cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
-        srow = await cursor.fetchone()
-        has_anxiety = bool(srow and srow["anxiety_detected"])
+        cursor = await conn.execute(
+            """SELECT COUNT(*) AS cnt FROM sessions
+               WHERE user_id = ? AND anxiety_detected = 1
+                 AND ended_at IS NOT NULL
+                 AND ended_at >= datetime('now', '-14 days')""",
+            (user_id,),
+        )
+        has_anxiety = bool((await cursor.fetchone())["cnt"])
         memories = await retrieve_relevant_memories(
             user_id=user_id,
             query=message,
             exclude_session_id=session_id,
         )
         extra_system_parts = []
+        if _is_crisis_message(message):
+            extra_system_parts.append(_CRISIS_OVERRIDE)
         if followup_hint:
             extra_system_parts.append(followup_hint)
         if weather:
@@ -583,34 +610,47 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
         messages.extend(context_prefix)
         messages.extend(history)
         messages.append({"role": "user", "content": current_user_content})
-        # function call RAG：追问类跳过工具，否则让模型自己决定是否查知识库
-        use_tool = not _is_rag_skip_follow_up(message)
-        force_tool = use_tool and any(kw in message for kw in _KNOWLEDGE_KEYWORDS)
-        if use_tool:
-            async def _rag_fn(query: str) -> list[str]:
-                texts, _, _ = await get_relevant_context(query, user_id)
-                RAG_STATS["total"] += 1
-                if texts:
-                    RAG_STATS["hits"] += 1
-                print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
-                return texts
+        # 危机场景：跳过 RAG，直接用 temperature=0.15 的 chat，确保覆盖指令生效
+        if _is_crisis_message(message):
+            try:
+                _t0 = time.monotonic()
+                from services.llm import chat as _chat_direct
+                reply = await _chat_direct(messages, extra_system=extra_system)
+                token_count = 0
+                latency_ms = int((time.monotonic() - _t0) * 1000)
+            except Exception as e:
+                reply = "嗯……我在这里。"
+                token_count = 0
+                latency_ms = 0
         else:
-            _rag_fn = None
-        try:
-            _t0 = time.monotonic()
-            reply, token_count = await chat_with_knowledge(messages, extra_system=extra_system, rag_fn=_rag_fn, force_tool=force_tool)
-            latency_ms = int((time.monotonic() - _t0) * 1000)
-        except Exception as e:
-            err = str(e).strip() or "API 调用失败"
-            if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
-                err = "API 密钥无效或已过期，请检查 .env 中的 OPENAI_API_KEY"
-            elif "429" in err or "402" in err or "quota" in err.lower() or "insufficient_quota" in err.lower() or "insufficient balance" in err.lower() or "insufficient_balance" in err.lower():
-                err = "账户余额不足或额度已用完。请到对应平台充值，或改用 DeepSeek 等 API。"
-            elif "connection" in err.lower() or "network" in err.lower():
-                err = "无法连接至 AI 服务，请检查网络或 OPENAI_BASE_URL"
-            elif "vision" in err.lower() or "image" in err.lower() or "multimodal" in err.lower() or "content" in err.lower():
-                err = "当前模型可能不支持看图。发图片时请使用支持多模态的模型（如 gpt-4o、qwen-vl、glm-4v 等），并在 .env 中设置对应的 OPENAI_MODEL。"
-            raise HTTPException(status_code=502, detail=err)
+            # function call RAG：追问类跳过工具，否则让模型自己决定是否查知识库
+            use_tool = not _is_rag_skip_follow_up(message)
+            force_tool = use_tool and any(kw in message for kw in _KNOWLEDGE_KEYWORDS)
+            if use_tool:
+                async def _rag_fn(query: str) -> list[str]:
+                    texts, _, _ = await get_relevant_context(query, user_id)
+                    RAG_STATS["total"] += 1
+                    if texts:
+                        RAG_STATS["hits"] += 1
+                    print(f"[FunctionCall] RAG 返回 {len(texts)} 条")
+                    return texts
+            else:
+                _rag_fn = None
+            try:
+                _t0 = time.monotonic()
+                reply, token_count = await chat_with_knowledge(messages, extra_system=extra_system, rag_fn=_rag_fn, force_tool=force_tool)
+                latency_ms = int((time.monotonic() - _t0) * 1000)
+            except Exception as e:
+                err = str(e).strip() or "API 调用失败"
+                if "api_key" in err.lower() or "auth" in err.lower() or "401" in err:
+                    err = "API 密钥无效或已过期，请检查 .env 中的 OPENAI_API_KEY"
+                elif "429" in err or "402" in err or "quota" in err.lower() or "insufficient_quota" in err.lower() or "insufficient balance" in err.lower() or "insufficient_balance" in err.lower():
+                    err = "账户余额不足或额度已用完。请到对应平台充值，或改用 DeepSeek 等 API。"
+                elif "connection" in err.lower() or "network" in err.lower():
+                    err = "无法连接至 AI 服务，请检查网络或 OPENAI_BASE_URL"
+                elif "vision" in err.lower() or "image" in err.lower() or "multimodal" in err.lower() or "content" in err.lower():
+                    err = "当前模型可能不支持看图。发图片时请使用支持多模态的模型（如 gpt-4o、qwen-vl、glm-4v 等），并在 .env 中设置对应的 OPENAI_MODEL。"
+                raise HTTPException(status_code=502, detail=err)
         clean_reply = _clean_reply(reply)
         try:
             await conn.execute(
@@ -915,15 +955,22 @@ async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_u
         (session_id,),
     )
     history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
-    cursor = await conn.execute("SELECT anxiety_detected FROM sessions WHERE id = ?", (session_id,))
-    srow = await cursor.fetchone()
-    has_anxiety = bool(srow and srow["anxiety_detected"])
+    cursor = await conn.execute(
+        """SELECT COUNT(*) AS cnt FROM sessions
+           WHERE user_id = ? AND anxiety_detected = 1
+             AND ended_at IS NOT NULL
+             AND ended_at >= datetime('now', '-14 days')""",
+        (user_id,),
+    )
+    has_anxiety = bool((await cursor.fetchone())["cnt"])
     memories = await retrieve_relevant_memories(
         user_id=user_id,
         query=req.message,
         exclude_session_id=session_id,
     )
     extra_system_parts = []
+    if _is_crisis_message(req.message):
+        extra_system_parts.append(_CRISIS_OVERRIDE)
     if req.weather:
         extra_system_parts.append(f"当前天气：{req.weather}。可在自然的情况下将天气融入对话，不要强行提及。")
     if req.voice_hint:
@@ -1009,6 +1056,169 @@ async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_u
     )
 
 
+# ---------- 语音一体化接口（STT + LLM流式 + 分句TTS，减少往返延迟）----------
+
+def _extract_voice_sentences(buffer: str) -> tuple[list[str], str]:
+    """从流式缓冲区中提取完整句子，返回 (完整句列表, 剩余未完成部分)。"""
+    sentences: list[str] = []
+    # 优先按 [NEXT] 分割
+    while "[NEXT]" in buffer:
+        idx = buffer.index("[NEXT]")
+        s = buffer[:idx].strip()
+        if s:
+            sentences.append(s)
+        buffer = buffer[idx + 6:].strip()
+    # 其次按句末标点分割，保留最后一段（可能未完成）
+    parts = re.split(r'(?<=[。！？…])', buffer)
+    if len(parts) > 1:
+        for p in parts[:-1]:
+            p = p.strip()
+            if p:
+                sentences.append(p)
+        buffer = parts[-1]
+    return sentences, buffer
+
+
+@app.post("/api/voice-turn")
+async def api_voice_turn(
+    audio: UploadFile = File(...),
+    session_id: Optional[int] = Form(None),
+    voice_hint: Optional[str] = Form(None),
+    weather: Optional[str] = Form(None),
+    user_id: int = Depends(get_current_user),
+):
+    """语音一体化：STT → 流式LLM（跳过RAG）→ 分句TTS，三段流水线，减少感知延迟。
+    返回 SSE 流，事件类型：stt / audio / done / error。
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="未配置 OPENAI_API_KEY")
+
+    audio_bytes = await audio.read()
+
+    async def gen():
+        conn = await get_db()
+        try:
+            # ── Step 1: STT ──
+            try:
+                stt_text = await transcribe_audio(audio_bytes, audio.filename or "audio.webm")
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'detail': f'STT失败: {e}'}, ensure_ascii=False)}\n\n"
+                return
+            yield f"data: {json.dumps({'type': 'stt', 'text': stt_text}, ensure_ascii=False)}\n\n"
+
+            # ── Step 2: 组装对话上下文（跳过RAG，速度优先）──
+            nonlocal session_id
+            await ensure_user(user_id)
+            if session_id is None:
+                await conn.execute("INSERT INTO sessions (user_id) VALUES (?)", (user_id,))
+                await conn.commit()
+                cursor = await conn.execute("SELECT last_insert_rowid() AS id")
+                session_id = (await cursor.fetchone())["id"]
+
+            cursor = await conn.execute(
+                "SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC LIMIT 30",
+                (session_id,),
+            )
+            history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
+            cursor = await conn.execute(
+                """SELECT COUNT(*) AS cnt FROM sessions
+                   WHERE user_id=? AND anxiety_detected=1
+                     AND ended_at IS NOT NULL AND ended_at >= datetime('now','-14 days')""",
+                (user_id,),
+            )
+            has_anxiety = bool((await cursor.fetchone())["cnt"])
+            memories = await retrieve_relevant_memories(
+                user_id=user_id, query=stt_text, exclude_session_id=session_id,
+            )
+            extra_parts: list[str] = []
+            if _is_crisis_message(stt_text):
+                extra_parts.append(_CRISIS_OVERRIDE)
+            if voice_hint:
+                extra_parts.append(f"【语音状态参考】用户本次说话时：{voice_hint}。请据此调整语气，不要直接提及。")
+            if weather:
+                extra_parts.append(f"当前天气：{weather}。可自然融入对话，不要强行提及。")
+            if has_anxiety:
+                extra_parts.append("注意：用户近期对话中曾表现出焦虑或压力，回复时请更温柔、多些共情与支持。")
+            if memories:
+                extra_parts.append(
+                    "以下是该用户的历史对话片段（长期记忆）：\n"
+                    + "\n".join(f"- {m}" for m in memories[:6])
+                    + "\n\n请优先依据这些片段回答用户的偏好/经历/之前提到的事情。"
+                )
+            extra_system = "\n\n".join(extra_parts)
+            messages = [{"role": "system", "content": COMPANION_SYSTEM}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": stt_text})
+
+            # ── Step 3: 流式LLM → 分句 → TTS 流水线 ──
+            sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+            reply_chunks: list[str] = []
+
+            async def _stream_llm():
+                buf = ""
+                async for chunk in chat_stream(messages, extra_system=extra_system):
+                    buf += chunk
+                    reply_chunks.append(chunk)
+                    sentences, buf = _extract_voice_sentences(buf)
+                    for s in sentences:
+                        await sentence_queue.put(s)
+                if buf.strip():
+                    await sentence_queue.put(buf.strip())
+                await sentence_queue.put(None)  # sentinel
+
+            llm_task = asyncio.create_task(_stream_llm())
+
+            while True:
+                sentence = await sentence_queue.get()
+                if sentence is None:
+                    break
+                try:
+                    audio_data = await synthesize_to_mp3(sentence)
+                    audio_b64 = base64.b64encode(audio_data).decode()
+                    yield f"data: {json.dumps({'type': 'audio', 'data': audio_b64, 'text': sentence}, ensure_ascii=False)}\n\n"
+                except Exception:
+                    # TTS失败不中断，只返回文字
+                    yield f"data: {json.dumps({'type': 'text', 'text': sentence}, ensure_ascii=False)}\n\n"
+
+            await llm_task
+
+            # ── Step 4: 写库 + 后台任务 ──
+            full_reply = "".join(reply_chunks)
+            clean_reply = _clean_reply(full_reply)
+            try:
+                await conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
+                    (session_id, "user", stt_text),
+                )
+                await conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
+                    (session_id, "assistant", clean_reply),
+                )
+                await conn.commit()
+            except Exception as e:
+                print(f"[VoiceTurn] 写库失败: {e}")
+            await add_turn_to_memory(
+                user_id=user_id, session_id=session_id,
+                user_message=stt_text, assistant_reply=clean_reply,
+            )
+            asyncio.ensure_future(extract_and_save_profiles(
+                user_id=user_id, session_id=session_id,
+                user_message=stt_text, db_path=DB_PATH,
+            ))
+            asyncio.ensure_future(_run_evaluation(session_id, stt_text, clean_reply, 0))
+
+            yield f"data: {json.dumps({'type': 'done', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+
+        finally:
+            await conn.close()
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ---------- 结束会话并生成总结、焦虑分析 ----------
 @app.post("/api/session/end")
 async def api_end_session(req: EndSessionRequest):
@@ -1054,10 +1264,63 @@ async def api_end_session(req: EndSessionRequest):
         await conn.close()
 
 
+_SESSION_TIMEOUT_HOURS = 3
+
+
+async def _auto_close_stale_sessions(user_id: int) -> None:
+    """将超过 3 小时无活动的未结束会话自动关闭并生成日记。后台静默执行，不影响主流程。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT s.id FROM sessions s
+               WHERE s.user_id = ? AND s.ended_at IS NULL
+                 AND (
+                   SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id
+                 ) < datetime('now', ?)
+                 AND EXISTS (SELECT 1 FROM messages m2 WHERE m2.session_id = s.id)""",
+            (user_id, f"-{_SESSION_TIMEOUT_HOURS} hours"),
+        )
+        stale = [r["id"] for r in await cursor.fetchall()]
+        for sid in stale:
+            try:
+                print(f"[AutoClose] session {sid} 超时自动结束", flush=True)
+                import httpx as _httpx
+                # 复用已有的结束逻辑
+                cursor2 = await conn.execute(
+                    "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+                    (sid,),
+                )
+                msgs = [{"role": r["role"], "content": r["content"]} for r in await cursor2.fetchall()]
+                if not msgs:
+                    await conn.execute("UPDATE sessions SET ended_at = datetime('now') WHERE id = ?", (sid,))
+                    await conn.commit()
+                    continue
+                anxiety = await analyze_anxiety(msgs)
+                summary = await generate_summary(msgs)
+                mood = "平静"
+                try:
+                    mood = await analyze_mood(msgs) or "平静"
+                except Exception:
+                    pass
+                mood_image_url = await generate_mood_image(mood, summary)
+                await conn.execute(
+                    "UPDATE sessions SET ended_at = datetime('now'), summary = ?, anxiety_detected = ?, mood = ?, mood_image_url = ? WHERE id = ?",
+                    (summary, 1 if anxiety else 0, mood, mood_image_url, sid),
+                )
+                await conn.commit()
+            except Exception as e:
+                print(f"[AutoClose] session {sid} 处理失败: {e}", flush=True)
+    except Exception as e:
+        print(f"[AutoClose] 查询失败: {e}", flush=True)
+    finally:
+        await conn.close()
+
+
 # ---------- 会话列表（左侧栏：不同话题，可继续上次对话）----------
 @app.get("/api/sessions")
 async def api_sessions(user_id: int = Depends(get_current_user), limit: int = 50):
     """获取用户的会话列表（含未结束的），按开始时间倒序。用于左侧栏展示、点击后加载该会话消息。"""
+    asyncio.ensure_future(_auto_close_stale_sessions(user_id))
     conn = await get_db()
     try:
         cursor = await conn.execute(

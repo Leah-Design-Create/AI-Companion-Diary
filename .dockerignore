@@ -1,0 +1,12 @@
+.env
+.env.local
+.env.*.local
+*.db
+.chroma/
+uploads/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.git/
+benchmark_results/

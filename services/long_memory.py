@@ -2,6 +2,7 @@
 """长期记忆：使用 ChromaDB 存储并检索历史对话片段。"""
 from __future__ import annotations
 
+import hashlib
 import threading
 import uuid
 import re
@@ -12,6 +13,7 @@ from config import (
     CHROMA_COLLECTION,
     CHROMA_DIR,
     LONG_MEMORY_MAX_CHARS,
+    LONG_MEMORY_MAX_DOCS,
     LONG_MEMORY_TOP_K,
 )
 from services.embedding import get_embedding
@@ -148,10 +150,34 @@ async def add_message_to_memory(
                 except Exception as e:
                     print(f"[LongMemory] add profile 失败: {e}")
 
+        _trim_user_memory(user_id)
         return True
     except Exception as e:
         print(f"[LongMemory] add 失败: {e}")
         return False
+
+
+def _trim_user_memory(user_id: int) -> None:
+    """若该用户文档数超过上限，删除最旧的一批，保持库不无限膨胀。"""
+    c = _get_collection()
+    if c is None or LONG_MEMORY_MAX_DOCS <= 0:
+        return
+    try:
+        result = c.get(
+            where={"user_id": int(user_id)},
+            include=["metadatas"],
+        )
+        ids = result.get("ids") or []
+        if len(ids) <= LONG_MEMORY_MAX_DOCS:
+            return
+        metas = result.get("metadatas") or []
+        pairs = sorted(zip(ids, metas), key=lambda x: x[1].get("created_at", ""))
+        n_delete = len(ids) - LONG_MEMORY_MAX_DOCS
+        ids_to_delete = [p[0] for p in pairs[:n_delete]]
+        c.delete(ids=ids_to_delete)
+        print(f"[LongMemory] trimmed {n_delete} old docs for user {user_id}")
+    except Exception as e:
+        print(f"[LongMemory] trim 失败: {e}")
 
 
 async def add_message_with_msg_id(
@@ -236,7 +262,8 @@ async def add_turn_to_memory(
     if not user_part:
         return False
     combined = f"用户：{user_part}\n小伴：{assistant_part}" if assistant_part else f"用户：{user_part}"
-    item_id = f"turn:{user_id}:{session_id}:{uuid.uuid4().hex}"
+    content_hash = hashlib.sha256(f"{user_id}:{session_id}:{combined}".encode()).hexdigest()[:16]
+    item_id = f"turn:{user_id}:{session_id}:{content_hash}"
     return await add_message_to_memory(
         user_id=user_id,
         session_id=session_id,

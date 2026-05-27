@@ -25,6 +25,7 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", ".chroma")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "chat_long_memory")
 LONG_MEMORY_TOP_K = int(os.getenv("LONG_MEMORY_TOP_K", "4"))
 LONG_MEMORY_MAX_CHARS = int(os.getenv("LONG_MEMORY_MAX_CHARS", "700"))
+LONG_MEMORY_MAX_DOCS = int(os.getenv("LONG_MEMORY_MAX_DOCS", "300"))
 
 # 通义 TTS（DashScope）
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")

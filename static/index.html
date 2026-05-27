@@ -1610,7 +1610,14 @@
       loadSessionMessages(sid);
     }
 
-    function newChat() {
+    async function newChat() {
+      const hasMessages = sessionId && document.getElementById('messages').children.length > 0;
+      if (hasMessages) {
+        const ok = window.confirm('新建对话会结束当前对话并生成日记，确定吗？');
+        if (!ok) return;
+        await endSessionAndSummarize();
+        await loadSummaries();
+      }
       sessionId = null;
       document.getElementById('messages').innerHTML = '';
       document.querySelectorAll('.session-row').forEach(el => el.classList.remove('active'));
@@ -1629,14 +1636,6 @@
       const panel = document.getElementById(panelId);
       if (panel) panel.classList.add('active');
       if (inputFooter) inputFooter.classList.toggle('hide', panelId !== 'chatPanel');
-      // 离开聊天面板时，主动结束当前会话并生成总结+心情画
-      if (panelId !== 'chatPanel' && sessionId) {
-        endSessionAndSummarize().then(() => {
-          if (panelId === 'notesPanel') loadSummaries();
-          if (panelId === 'reportPanel') loadWeeklyReport();
-        });
-        return; // 等 endSession 完成后再加载
-      }
       if (panelId === 'notesPanel') loadSummaries();
       if (panelId === 'chatPanel') fetchTodayMood();
       if (panelId === 'reportPanel') loadWeeklyReport();
