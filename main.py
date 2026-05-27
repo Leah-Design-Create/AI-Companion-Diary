@@ -88,6 +88,41 @@ def _is_crisis_message(text: str) -> bool:
     return any(kw in text for kw in _CRISIS_KEYWORDS)
 
 
+# ---------- 当前对话实时焦虑检测 ----------
+# 内存缓存：session_id -> True（一旦检测到焦虑，本次对话后续消息持续使用温柔语气）
+_session_anxiety_cache: dict[int, bool] = {}
+
+_ANXIETY_QUICK_RE = re.compile(
+    r"焦虑|压力大|压力很大|紧张|害怕|恐惧|担心|崩溃|抑郁|难受|很痛苦|绝望|迷茫|"
+    r"好烦|好累|撑不住|不想活|喘不过气|焦躁|心慌|睡不着|失眠|心跳|发抖|手抖|"
+    r"控制不了|情绪崩了|情绪失控|哭了|一直哭|哭不停"
+)
+
+
+async def _check_current_session_anxiety(session_id: int, history: list[dict]) -> bool:
+    """实时检测当前对话是否出现焦虑信号。
+    - 已缓存为 True 则直接返回，无需重复检测。
+    - 先用正则快速筛，命中后再调 LLM 确认，避免每条消息都多一次 LLM 调用。
+    """
+    if _session_anxiety_cache.get(session_id):
+        return True
+
+    # 只看最近 6 条用户消息
+    user_msgs = [m for m in history if m.get("role") == "user"][-6:]
+    if not user_msgs:
+        return False
+
+    combined = " ".join(m.get("content", "") for m in user_msgs)
+    if not _ANXIETY_QUICK_RE.search(combined):
+        return False  # 无关键词，跳过 LLM，直接返回 False
+
+    # 关键词命中，用 LLM 确认
+    detected = await analyze_anxiety(user_msgs)
+    if detected:
+        _session_anxiety_cache[session_id] = True
+    return detected
+
+
 # 含这些词时强制调用知识库（模型可能自认为知道答案而跳过搜索）
 _KNOWLEDGE_KEYWORDS = frozenset({
     "焦虑", "情绪", "心理", "压力", "恐惧", "抑郁", "紧张", "症状", "治疗",
@@ -568,14 +603,7 @@ async def _run_chat(user_id: int, session_id: Optional[int], message: str, image
             if role == "user" and img_path:
                 content = _image_path_to_content_parts(content or "", img_path, UPLOAD_DIR)
             history.append({"role": role, "content": content})
-        cursor = await conn.execute(
-            """SELECT COUNT(*) AS cnt FROM sessions
-               WHERE user_id = ? AND anxiety_detected = 1
-                 AND ended_at IS NOT NULL
-                 AND ended_at >= datetime('now', '-14 days')""",
-            (user_id,),
-        )
-        has_anxiety = bool((await cursor.fetchone())["cnt"])
+        has_anxiety = await _check_current_session_anxiety(session_id, history)
         memories = await retrieve_relevant_memories(
             user_id=user_id,
             query=message,
@@ -955,14 +983,7 @@ async def api_chat_stream(req: ChatRequest, user_id: int = Depends(get_current_u
         (session_id,),
     )
     history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
-    cursor = await conn.execute(
-        """SELECT COUNT(*) AS cnt FROM sessions
-           WHERE user_id = ? AND anxiety_detected = 1
-             AND ended_at IS NOT NULL
-             AND ended_at >= datetime('now', '-14 days')""",
-        (user_id,),
-    )
-    has_anxiety = bool((await cursor.fetchone())["cnt"])
+    has_anxiety = await _check_current_session_anxiety(session_id, history)
     memories = await retrieve_relevant_memories(
         user_id=user_id,
         query=req.message,
@@ -1120,13 +1141,7 @@ async def api_voice_turn(
                 (session_id,),
             )
             history = [{"role": r["role"], "content": r["content"]} for r in await cursor.fetchall()]
-            cursor = await conn.execute(
-                """SELECT COUNT(*) AS cnt FROM sessions
-                   WHERE user_id=? AND anxiety_detected=1
-                     AND ended_at IS NOT NULL AND ended_at >= datetime('now','-14 days')""",
-                (user_id,),
-            )
-            has_anxiety = bool((await cursor.fetchone())["cnt"])
+            has_anxiety = await _check_current_session_anxiety(session_id, history)
             memories = await retrieve_relevant_memories(
                 user_id=user_id, query=stt_text, exclude_session_id=session_id,
             )
@@ -1256,6 +1271,7 @@ async def api_end_session(req: EndSessionRequest):
             (summary, 1 if anxiety else 0, mood, mood_image_url, req.session_id),
         )
         await conn.commit()
+        _session_anxiety_cache.pop(req.session_id, None)  # 会话结束，清除实时焦虑缓存
         return {"session_id": req.session_id, "summary": summary, "anxiety_detected": anxiety, "mood": mood, "mood_image_url": mood_image_url}
     except Exception as e:
         print(f"[session/end] ERROR: {e}", flush=True)
@@ -1290,16 +1306,21 @@ async def api_session_greeting(user_id: int = Depends(get_current_user)):
     """检查近 7 天内是否有焦虑会话，有则生成一句温暖的开场问候。"""
     conn = await get_db()
     try:
+        # 取今天之前、7 天内最近一次结束的对话
+        # 用 date(ended_at) < date('now') 排除同一天内新建对话的情况
         cursor = await conn.execute(
-            """SELECT summary, mood FROM sessions
-               WHERE user_id = ? AND anxiety_detected = 1
+            """SELECT summary, mood, anxiety_detected FROM sessions
+               WHERE user_id = ?
                  AND ended_at IS NOT NULL
                  AND ended_at >= datetime('now', '-7 days')
+                 AND date(ended_at) < date('now')
                ORDER BY ended_at DESC LIMIT 1""",
             (user_id,),
         )
         row = await cursor.fetchone()
-        if not row:
+        # 只有最近一次对话本身是焦虑的才触发问候
+        # 避免"上上次焦虑，但昨天已经好好聊了一次"却仍然出现问候的情况
+        if not row or not row["anxiety_detected"]:
             return {"has_greeting": False, "greeting": None}
 
         summary = (row["summary"] or "").strip()
