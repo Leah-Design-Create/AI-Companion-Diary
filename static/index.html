@@ -1622,6 +1622,17 @@
       document.getElementById('messages').innerHTML = '';
       document.querySelectorAll('.session-row').forEach(el => el.classList.remove('active'));
       loadSessions();
+
+      // 检查近 7 天内是否有焦虑会话，有则显示一句关心的开场白
+      try {
+        const r = await apiFetch('/api/session/greeting');
+        if (r.ok) {
+          const data = await r.json();
+          if (data.has_greeting && data.greeting) {
+            addMessage('bot', data.greeting);
+          }
+        }
+      } catch(e) { /* 静默失败，不影响正常流程 */ }
     }
 
     document.getElementById('btnNewChat').addEventListener('click', newChat);
@@ -2571,6 +2582,12 @@
       return fetch(API_BASE + url, Object.assign({}, opts, { headers: h }));
     }
 
+    // 检测是否是刷新（beforeunload 存入了 sessionStorage，关闭标签页时会被清除）
+    const _refreshSessionId = sessionStorage.getItem('_refreshSessionId');
+    const _refreshToken = sessionStorage.getItem('_refreshToken');
+    sessionStorage.removeItem('_refreshSessionId');
+    sessionStorage.removeItem('_refreshToken');
+
     function onAuthSuccess(data) {
       userId = data.user_id;
       if (data.token) setToken(data.token);
@@ -2586,15 +2603,36 @@
       checkIn();
       fetchTodayMood();
       fetchWeather();
-      loadSessions().then(sessions => {
-        if (sessions && sessions.length > 0) {
-          sessionId = sessions[0].session_id;
-          loadSessionMessages(sessionId).then(() => {
-            document.querySelectorAll('.session-row').forEach(el => {
-              el.classList.toggle('active', parseInt(el.getAttribute('data-sid'), 10) === sessionId);
+
+      // 如果是刷新页面，先撤销刚刚结束的会话
+      const doReopenIfRefresh = async () => {
+        if (_refreshSessionId && _refreshToken) {
+          try {
+            await apiFetch('/api/session/reopen', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: parseInt(_refreshSessionId) }),
             });
-          });
+          } catch(e) { /* 静默失败，不影响后续流程 */ }
         }
+      };
+
+      doReopenIfRefresh().then(() => {
+        loadSessions().then(sessions => {
+          if (sessions && sessions.length > 0) {
+            // 刷新时优先恢复原 session，否则默认取最新
+            const preferredId = _refreshSessionId ? parseInt(_refreshSessionId) : null;
+            const target = preferredId
+              ? (sessions.find(s => s.session_id === preferredId) || sessions[0])
+              : sessions[0];
+            sessionId = target.session_id;
+            loadSessionMessages(sessionId).then(() => {
+              document.querySelectorAll('.session-row').forEach(el => {
+                el.classList.toggle('active', parseInt(el.getAttribute('data-sid'), 10) === sessionId);
+              });
+            });
+          }
+        });
       });
     }
 
@@ -3284,8 +3322,13 @@
     });
     // beforeunload 用 sendBeacon 代替 fetch，浏览器保证发出去
     // token 放 query string，因为 sendBeacon 无法设置 Authorization header
+    // 同时把 sessionId 存入 sessionStorage：
+    //   - 刷新时 sessionStorage 保留 → 页面加载时检测到，调用 reopen 撤销结束
+    //   - 关闭标签页时 sessionStorage 被清除 → 不会触发 reopen，会话正常结束
     window.addEventListener('beforeunload', () => {
       if (!sessionId || !authToken) return;
+      sessionStorage.setItem('_refreshSessionId', String(sessionId));
+      sessionStorage.setItem('_refreshToken', authToken);
       const body = JSON.stringify({ session_id: sessionId });
       navigator.sendBeacon(
         `${API_BASE}/api/session/end?token=${encodeURIComponent(authToken)}`,

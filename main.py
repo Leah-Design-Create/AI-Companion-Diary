@@ -1264,6 +1264,65 @@ async def api_end_session(req: EndSessionRequest):
         await conn.close()
 
 
+@app.post("/api/session/reopen")
+async def api_reopen_session(req: EndSessionRequest):
+    """刷新页面时撤销刚刚结束的会话（仅允许 30 秒内）。"""
+    conn = await get_db()
+    try:
+        await conn.execute(
+            """UPDATE sessions
+               SET ended_at = NULL, summary = NULL, anxiety_detected = 0,
+                   mood = NULL, mood_image_url = NULL
+               WHERE id = ?
+                 AND ended_at IS NOT NULL
+                 AND ended_at >= datetime('now', '-30 seconds')""",
+            (req.session_id,),
+        )
+        await conn.commit()
+        print(f"[session/reopen] session={req.session_id} reopened (refresh detected)", flush=True)
+        return {"ok": True, "session_id": req.session_id}
+    finally:
+        await conn.close()
+
+
+@app.get("/api/session/greeting")
+async def api_session_greeting(user_id: int = Depends(get_current_user)):
+    """检查近 7 天内是否有焦虑会话，有则生成一句温暖的开场问候。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            """SELECT summary, mood FROM sessions
+               WHERE user_id = ? AND anxiety_detected = 1
+                 AND ended_at IS NOT NULL
+                 AND ended_at >= datetime('now', '-7 days')
+               ORDER BY ended_at DESC LIMIT 1""",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"has_greeting": False, "greeting": None}
+
+        summary = (row["summary"] or "").strip()
+        mood = (row["mood"] or "有些低落").strip()
+
+        prompt = (
+            f"上次和用户对话时，用户情绪：{mood}。\n"
+            + (f"上次对话摘要：{summary[:200]}\n" if summary else "")
+            + "\n请用一句温暖自然的话（15～25字）作为这次对话的开场白，"
+            "关心用户今天的状态，像老朋友一样，不要太正式。"
+            "直接输出这句话，不要加引号或任何解释。"
+        )
+        try:
+            greeting = await chat([{"role": "user", "content": prompt}])
+            greeting = (greeting or "").strip() or "上次聊完我一直有点挂念你，今天感觉怎么样？"
+        except Exception:
+            greeting = "上次聊完我一直有点挂念你，今天感觉怎么样？"
+
+        return {"has_greeting": True, "greeting": greeting}
+    finally:
+        await conn.close()
+
+
 _SESSION_TIMEOUT_HOURS = 3
 
 
