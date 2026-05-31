@@ -483,6 +483,12 @@
     .btn-send:active { transform: scale(0.96); }
     .btn-send:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
     .btn-send svg { width: 20px; height: 20px; }
+    .btn-send .icon-mic,
+    .btn-send .icon-send { display: flex; align-items: center; justify-content: center; }
+    .btn-send .icon-send { display: none; }
+    .btn-send.has-text .icon-mic { display: none; }
+    .btn-send.has-text .icon-send { display: flex; }
+    .btn-send.recording { background: #fef2f2 !important; color: #b91c1c !important; box-shadow: none !important; animation: pulse 1.5s ease-in-out infinite; }
 
     #notesPanel { display: flex; flex-direction: row; min-height: 0; overflow: hidden; padding: 0; }
     #notesPanel::-webkit-scrollbar { width: 4px; }
@@ -1440,8 +1446,9 @@
             <button type="button" id="imageBtn" title="插入图片" aria-label="插入图片">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
             </button>
-            <button type="button" id="sendBtn" class="btn-send" title="发送" aria-label="发送">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+            <button type="button" id="sendBtn" class="btn-send" title="语音输入" aria-label="语音输入/发送">
+              <span class="icon-mic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></span>
+              <span class="icon-send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg></span>
             </button>
           </div>
           </div>
@@ -2768,12 +2775,32 @@
 
     (function initVoiceInput() {
       const micBtn = document.getElementById('micBtn');
+      const sendBtn = document.getElementById('sendBtn');
       const input = document.getElementById('input');
+
+      function syncSendBtn() {
+        const hasContent = (input && input.value.trim().length > 0) || !!pendingImage;
+        if (sendBtn) {
+          sendBtn.classList.toggle('has-text', hasContent);
+          sendBtn.title = hasContent ? '发送' : '语音输入';
+        }
+      }
+      if (input) input.addEventListener('input', syncSendBtn);
+      window._syncSendBtn = syncSendBtn;
+
       if (!navigator.mediaDevices || !window.MediaRecorder) {
         if (micBtn) micBtn.title = '当前浏览器不支持语音输入';
+        if (sendBtn) { sendBtn.classList.add('has-text'); sendBtn.addEventListener('click', sendMessage); }
         return;
       }
+
       let micRecorder = null, micChunks = [];
+
+      function setRecordingState(on) {
+        if (micBtn) { micBtn.classList.toggle('recording', on); micBtn.title = on ? '正在听…' : '语音输入'; }
+        if (sendBtn) sendBtn.classList.toggle('recording', on);
+      }
+
       async function startMicRecording() {
         try {
           _ensureTTSCtx();
@@ -2784,7 +2811,7 @@
           micRecorder.ondataavailable = e => { if (e.data.size > 0) micChunks.push(e.data); };
           micRecorder.onstop = async () => {
             stream.getTracks().forEach(t => t.stop());
-            if (micBtn) { micBtn.classList.remove('recording'); micBtn.title = '语音输入'; }
+            setRecordingState(false);
             const blob = new Blob(micChunks, { type: micRecorder.mimeType });
             if (blob.size < 500) return;
             const ext = (micRecorder.mimeType || 'audio/webm').split('/')[1].split(';')[0];
@@ -2799,18 +2826,24 @@
             } catch(_) {}
           };
           micRecorder.start();
-          if (micBtn) { micBtn.classList.add('recording'); micBtn.title = '正在听…'; }
+          setRecordingState(true);
         } catch(e) {
-          if (micBtn) micBtn.classList.remove('recording');
+          setRecordingState(false);
         }
       }
-      if (micBtn) micBtn.addEventListener('click', () => {
-        if (micRecorder && micRecorder.state === 'recording') { micRecorder.stop(); }
-        else { startMicRecording(); }
+
+      function toggleRecording() {
+        if (micRecorder && micRecorder.state === 'recording') micRecorder.stop();
+        else startMicRecording();
+      }
+
+      if (micBtn) micBtn.addEventListener('click', toggleRecording);
+      if (sendBtn) sendBtn.addEventListener('click', () => {
+        const hasContent = (input && input.value.trim().length > 0) || !!pendingImage;
+        if (hasContent) sendMessage();
+        else toggleRecording();
       });
     })();
-
-    document.getElementById('sendBtn').addEventListener('click', sendMessage);
 
     // PTT 按钮事件（鼠标 + 触摸）
     (function() {
@@ -2832,12 +2865,14 @@
       if (file && file.type.startsWith('image/')) {
         pendingImage = file;
         updateImagePreview();
+        if (window._syncSendBtn) window._syncSendBtn();
       }
       this.value = '';
     });
     document.getElementById('previewRemove').addEventListener('click', function() {
       pendingImage = null;
       updateImagePreview();
+      if (window._syncSendBtn) window._syncSendBtn();
     });
 
     let diaryDatesSet = new Set();
