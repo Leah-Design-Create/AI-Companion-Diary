@@ -12,6 +12,7 @@ from pathlib import Path
 from config import (
     CHROMA_COLLECTION,
     CHROMA_DIR,
+    DB_PATH,
     LONG_MEMORY_MAX_CHARS,
     LONG_MEMORY_MAX_DOCS,
     LONG_MEMORY_TOP_K,
@@ -73,6 +74,44 @@ def _is_name_query(q: str) -> bool:
     if not s:
         return False
     return any(k in s for k in ("名字", "称呼", "怎么叫", "你叫", "我叫", "我叫什么", "你还记得我"))
+
+
+def _should_analyze_for_memory(text: str) -> bool:
+    s = (text or "").strip()
+    if len(s) < 4:
+        return False
+    if _extract_user_name_profiles(s):
+        return True
+    signals = (
+        "我叫", "我名叫", "名字是", "我姓", "我是",
+        "生日", "家乡", "老家", "住在",
+        "我喜欢", "我爱", "我讨厌", "我不喜欢", "我偏好",
+        "我最近", "最近在", "这段时间", "一直在", "正在",
+        "我爸", "我妈", "我朋友", "我同事", "我对象", "我男朋友", "我女朋友",
+        "下周", "明天", "后天", "月底", "下个月", "以后提醒我", "下次问我",
+        "准备", "面试", "考试", "考研", "工作", "项目", "搬家",
+    )
+    return any(k in s for k in signals)
+
+
+def _normalize_memory_type(kind: str) -> str:
+    mapping = {
+        "name": "identity",
+        "identity": "identity",
+        "preference": "preference",
+        "relationship": "relationship",
+        "experience": "event",
+        "event": "event",
+        "feeling": "emotion_pattern",
+        "emotion_pattern": "emotion_pattern",
+        "followup": "followup",
+    }
+    return mapping.get((kind or "").strip(), "")
+
+
+def _normalize_memory_content(text: str) -> str:
+    s = re.sub(r"^用户(身份|姓名|姓氏|偏好|关系|经历|事件|情绪状态|情绪模式|待跟进)[:：]", "", text or "")
+    return _normalize_for_compare(s)
 
 
 def _get_collection():
@@ -180,6 +219,173 @@ def _trim_user_memory(user_id: int) -> None:
         print(f"[LongMemory] trim 失败: {e}")
 
 
+async def _ensure_memories_schema(conn) -> None:
+    await conn.executescript("""
+    CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        session_id INTEGER,
+        source_message_id INTEGER,
+        type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source_quote TEXT,
+        scope TEXT DEFAULT 'stable',
+        sensitivity TEXT DEFAULT 'low',
+        confidence REAL DEFAULT 1.0,
+        status TEXT DEFAULT 'active',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        expires_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_memories_user_status
+        ON memories(user_id, status);
+    CREATE INDEX IF NOT EXISTS idx_memories_user_type
+        ON memories(user_id, type);
+    """)
+
+
+async def _index_memory_doc(
+    *,
+    memory_id: int,
+    user_id: int,
+    session_id: int | None,
+    memory_type: str,
+    content: str,
+    created_at: str | None = None,
+) -> bool:
+    c = _get_collection()
+    if c is None:
+        return False
+    doc = _truncate(content, LONG_MEMORY_MAX_CHARS)
+    if not doc:
+        return False
+    emb = await get_embedding(doc)
+    if not emb:
+        return False
+    meta = {
+        "user_id": int(user_id),
+        "memory_id": int(memory_id),
+        "session_id": int(session_id or 0),
+        "role": "user",
+        "kind": memory_type,
+        "status": "active",
+        "created_at": created_at or _now_iso(),
+    }
+    try:
+        cid = f"memory:{int(memory_id)}"
+        if hasattr(c, "upsert"):
+            c.upsert(ids=[cid], documents=[doc], embeddings=[emb], metadatas=[meta])
+        else:
+            try:
+                c.delete(ids=[cid])
+            except Exception:
+                pass
+            c.add(ids=[cid], documents=[doc], embeddings=[emb], metadatas=[meta])
+        _trim_user_memory(user_id)
+        return True
+    except Exception as e:
+        print(f"[LongMemory] index memory 失败: {e}")
+        return False
+
+
+async def _save_structured_memory(
+    *,
+    user_id: int,
+    session_id: int,
+    memory_type: str,
+    content: str,
+    source_quote: str = "",
+    scope: str = "stable",
+    sensitivity: str = "low",
+    confidence: float = 1.0,
+    expires_at: str | None = None,
+    db_path: str | None = None,
+) -> bool:
+    import aiosqlite
+
+    mtype = _normalize_memory_type(memory_type)
+    text = _truncate(content, LONG_MEMORY_MAX_CHARS)
+    if not mtype or not text:
+        return False
+    try:
+        conf = float(confidence)
+    except Exception:
+        conf = 0.0
+    if conf < 0.7:
+        return False
+    if sensitivity not in {"low", "medium", "high"}:
+        sensitivity = "low"
+    if sensitivity == "high":
+        return False
+    if scope not in {"stable", "recent", "temporary"}:
+        scope = "stable"
+
+    path = db_path or DB_PATH
+    async with aiosqlite.connect(path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await _ensure_memories_schema(conn)
+
+        norm = _normalize_memory_content(text)
+        cursor = await conn.execute(
+            """SELECT id, content FROM memories
+               WHERE user_id = ? AND type = ? AND status = 'active'
+               ORDER BY updated_at DESC LIMIT 50""",
+            (int(user_id), mtype),
+        )
+        for row in await cursor.fetchall():
+            if _normalize_memory_content(row["content"]) == norm:
+                await conn.execute(
+                    "UPDATE memories SET updated_at = datetime('now') WHERE id = ?",
+                    (int(row["id"]),),
+                )
+                await conn.commit()
+                await _index_memory_doc(
+                    memory_id=int(row["id"]),
+                    user_id=user_id,
+                    session_id=session_id,
+                    memory_type=mtype,
+                    content=text,
+                )
+                return False
+
+        if mtype == "identity":
+            await conn.execute(
+                """UPDATE memories
+                   SET status = 'superseded', updated_at = datetime('now')
+                   WHERE user_id = ? AND type = 'identity' AND status = 'active'""",
+                (int(user_id),),
+            )
+
+        cursor = await conn.execute(
+            """INSERT INTO memories
+               (user_id, session_id, type, content, source_quote, scope,
+                sensitivity, confidence, status, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            (
+                int(user_id),
+                int(session_id),
+                mtype,
+                text,
+                _truncate(source_quote, LONG_MEMORY_MAX_CHARS),
+                scope,
+                sensitivity,
+                conf,
+                expires_at,
+            ),
+        )
+        memory_id = int(cursor.lastrowid)
+        await conn.commit()
+
+    await _index_memory_doc(
+        memory_id=memory_id,
+        user_id=user_id,
+        session_id=session_id,
+        memory_type=mtype,
+        content=text,
+    )
+    return True
+
+
 async def add_message_with_msg_id(
     *,
     msg_id: int,
@@ -189,15 +395,21 @@ async def add_message_with_msg_id(
     content: str,
     created_at: str | None = None,
 ) -> bool:
-    """用稳定的消息 ID 写入，适合历史回填避免重复。"""
-    return await add_message_to_memory(
+    """Compatibility backfill hook.
+
+    Full historical messages are no longer written to Chroma as long-term
+    memory. For old backfills, only deterministic user identity snippets are
+    promoted into structured memories.
+    """
+    added = await add_user_name_profiles_with_msg_id(
+        msg_id=msg_id,
         user_id=user_id,
         session_id=session_id,
         role=role,
         content=content,
         created_at=created_at,
-        item_id=f"msg:{int(msg_id)}",
     )
+    return added > 0
 
 
 async def add_user_name_profiles_with_msg_id(
@@ -212,34 +424,26 @@ async def add_user_name_profiles_with_msg_id(
     """只补写姓名/称呼类 profile 片段（不写整段原文），用于对已存在的旧消息做增量修复。"""
     if role != "user":
         return 0
-    c = _get_collection()
-    if c is None:
-        return 0
     text = _truncate(content, LONG_MEMORY_MAX_CHARS)
     profiles = _extract_user_name_profiles(text)
     if not profiles:
         return 0
 
-    doc_base = f"msg:{int(msg_id)}"
     added = 0
-    for i, (pdoc, kind) in enumerate(profiles):
+    for pdoc, kind in profiles:
         try:
-            emb = await get_embedding(pdoc)
-            if not emb:
-                continue
-            pid = f"{doc_base}:profile:{kind}:{i}"
-            meta = {
-                "user_id": int(user_id),
-                "session_id": int(session_id),
-                "role": role,
-                "kind": kind,
-                "created_at": created_at or _now_iso(),
-            }
-            if hasattr(c, "upsert"):
-                c.upsert(ids=[pid], documents=[pdoc], embeddings=[emb], metadatas=[meta])
-            else:
-                c.add(ids=[pid], documents=[pdoc], embeddings=[emb], metadatas=[meta])
-            added += 1
+            ok = await _save_structured_memory(
+                user_id=user_id,
+                session_id=session_id,
+                memory_type="identity",
+                content=pdoc,
+                source_quote=text,
+                scope="stable",
+                sensitivity="low",
+                confidence=1.0,
+            )
+            if ok:
+                added += 1
         except Exception as e:
             print(f"[LongMemory] add name profile 失败: {e}")
     return added
@@ -253,26 +457,26 @@ async def add_turn_to_memory(
     assistant_reply: str,
     created_at: str | None = None,
 ) -> bool:
-    """将一轮完整对话（用户消息 + 助手回复）作为一个单元写入长期记忆。
-    相比分条存储，保留了上下文，召回时能看到完整的一问一答。
+    """Compatibility hook: do not store full turns as long-term memory.
+
+    Long-term memory is now written by extract_and_save_profiles() as
+    structured memory rows in SQLite, with ChromaDB used only as an index.
+    This hook keeps a cheap deterministic path for explicit name statements.
     """
-    max_each = max(50, (LONG_MEMORY_MAX_CHARS - 20) // 2)
-    user_part = _truncate(user_message, max_each)
-    assistant_part = _truncate(assistant_reply, max_each)
-    if not user_part:
-        return False
-    combined = f"用户：{user_part}\n小伴：{assistant_part}" if assistant_part else f"用户：{user_part}"
-    content_hash = hashlib.sha256(f"{user_id}:{session_id}:{combined}".encode()).hexdigest()[:16]
-    item_id = f"turn:{user_id}:{session_id}:{content_hash}"
-    return await add_message_to_memory(
-        user_id=user_id,
-        session_id=session_id,
-        role="user",
-        content=combined,
-        created_at=created_at,
-        item_id=item_id,
-        _profile_source=user_part,  # 只从用户原文提取姓名，不扫描助手回复
-    )
+    user_part = _truncate(user_message, LONG_MEMORY_MAX_CHARS)
+    saved = False
+    for doc, kind in _extract_user_name_profiles(user_part):
+        saved = await _save_structured_memory(
+            user_id=user_id,
+            session_id=session_id,
+            memory_type="identity" if kind == "profile_name" else "identity",
+            content=doc,
+            source_quote=user_part,
+            scope="stable",
+            sensitivity="low",
+            confidence=1.0,
+        ) or saved
+    return saved
 
 
 async def retrieve_relevant_memories(
@@ -282,45 +486,57 @@ async def retrieve_relevant_memories(
     limit: int | None = None,
     exclude_session_id: int | None = None,
 ) -> list[str]:
-    """按用户检索相关历史对话片段。"""
-    c = _get_collection()
-    if c is None:
-        return []
+    """按用户检索相关结构化长期记忆。"""
     q = (query or "").strip()
     if not q:
         return []
+    n = max(1, int(limit or LONG_MEMORY_TOP_K))
+    is_name_q = _is_name_query(q)
+    candidates: list[tuple[float, str]] = []
+    seen: set[str] = set()
+
+    if is_name_q:
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                await _ensure_memories_schema(conn)
+                cursor = await conn.execute(
+                    """SELECT content FROM memories
+                       WHERE user_id = ? AND type = 'identity'
+                         AND status = 'active'
+                         AND (expires_at IS NULL OR expires_at > datetime('now'))
+                       ORDER BY updated_at DESC, id DESC
+                       LIMIT 3""",
+                    (int(user_id),),
+                )
+                rows = await cursor.fetchall()
+            for row in rows:
+                doc_text = str(row["content"] or "").strip()
+                if not doc_text:
+                    continue
+                text = f"用户记忆：{doc_text}"
+                if text not in seen:
+                    seen.add(text)
+                    candidates.append((-1.0, text))
+        except Exception as e:
+            print(f"[LongMemory] identity 直接查询失败: {e}")
+
+    c = _get_collection()
+    if c is None:
+        return [t for _, t in sorted(candidates)[:n]]
     q_norm = _normalize_for_compare(q)
     emb = await get_embedding(q)
     if not emb:
-        return []
-    n = max(1, int(limit or LONG_MEMORY_TOP_K))
-    is_name_q = _is_name_query(q)
+        return [t for _, t in sorted(candidates)[:n]]
     try:
-        candidates: list[tuple[float, str]] = []
-        seen: set[str] = set()
-
-        # 名字查询：先直接取出所有 profile 条目，强制加入候选（不依赖向量排名）
-        if is_name_q:
-            try:
-                profile_result = c.get(
-                    where={"$and": [{"user_id": int(user_id)}, {"kind": "profile_name"}]},
-                    include=["documents", "metadatas"],
-                )
-                for pdoc, pmeta in zip(profile_result.get("documents") or [], profile_result.get("metadatas") or []):
-                    if not pdoc:
-                        continue
-                    doc_text = str(pdoc).strip()
-                    text = f"用户：{doc_text}"
-                    if text not in seen:
-                        seen.add(text)
-                        candidates.append((-1.0, text))  # 最优先
-            except Exception as e:
-                print(f"[LongMemory] profile 直接查询失败: {e}")
+        import aiosqlite
 
         result = c.query(
             query_embeddings=[emb],
             n_results=n * 6 if exclude_session_id else n * 4,
-            where={"user_id": int(user_id)},
+            where={"$and": [{"user_id": int(user_id)}, {"status": "active"}]},
             include=["documents", "metadatas", "distances"],
         )
         docs = result.get("documents") or []
@@ -328,6 +544,7 @@ async def retrieve_relevant_memories(
         dists = result.get("distances") or []
         if not docs:
             return [t for _, t in sorted(candidates)[:n]]
+        memory_hits: list[tuple[float, int]] = []
         for idx, doc in enumerate(docs[0]):
             if not doc:
                 continue
@@ -340,22 +557,43 @@ async def retrieve_relevant_memories(
             meta = metas[0][idx] if metas and metas[0] and idx < len(metas[0]) else {}
             if exclude_session_id is not None and int(meta.get("session_id", -1)) == int(exclude_session_id):
                 continue
-            role = str(meta.get("role", "user"))
-            prefix = "用户" if role == "user" else "小伴"
-            text = f"{prefix}：{doc_text}"
-            if text in seen:
+            memory_id = meta.get("memory_id")
+            if memory_id is None:
                 continue
-            seen.add(text)
             dist = 9e9
             if dists and dists[0] and idx < len(dists[0]):
                 try:
                     dist = float(dists[0][idx])
                 except Exception:
                     pass
-            # 偏向保留用户自己说过的话，跨会话"记住我"场景更稳。
-            if role == "user":
-                dist -= 0.08
-            candidates.append((dist, text))
+            memory_hits.append((dist, int(memory_id)))
+        if memory_hits:
+            ids = []
+            for _, mid in sorted(memory_hits, key=lambda x: x[0]):
+                if mid not in ids:
+                    ids.append(mid)
+            placeholders = ",".join("?" for _ in ids)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                await _ensure_memories_schema(conn)
+                cursor = await conn.execute(
+                    f"""SELECT id, type, content FROM memories
+                        WHERE user_id = ? AND status = 'active'
+                          AND (expires_at IS NULL OR expires_at > datetime('now'))
+                          AND id IN ({placeholders})""",
+                    (int(user_id), *ids),
+                )
+                rows = await cursor.fetchall()
+            by_id = {int(r["id"]): r for r in rows}
+            for dist, mid in sorted(memory_hits, key=lambda x: x[0]):
+                row = by_id.get(mid)
+                if not row:
+                    continue
+                text = f"用户记忆（{row['type']}）：{row['content']}"
+                if text in seen:
+                    continue
+                seen.add(text)
+                candidates.append((dist, text))
         candidates.sort(key=lambda x: x[0])
         out = [t for _, t in candidates[:n]]
         return out
@@ -367,15 +605,20 @@ async def retrieve_relevant_memories(
 # ---------- 用户画像提取 + 情绪检测（合并为一次后台 LLM 调用）----------
 
 _ANALYZE_SYSTEM = """分析用户这条消息，完成以下两件事：
-1. 调用 save_profiles：提取用户明确透露的个人信息（姓名、偏好、经历、情绪状态），没有则传空数组
+1. 调用 save_profiles：只提取值得长期记住的结构化信息，没有则传空数组
 2. 调用 report_emotion：判断用户当前情绪（2-4个字）和是否存在焦虑/压力
 
 规则：
 - 只提取用户明确说出的内容，不要推断
-- name：用户说了自己的名字（"我叫X""我是X"）
-- preference：用户提到的喜好（食物、饮料、爱好等）
-- experience：用户提到的近期经历或重要事件
-- feeling：用户明确表达的持续性情绪
+- 不保存寒暄、一次性闲聊、无具体对象的普通情绪词
+- identity：姓名、称呼等稳定身份信息
+- preference：稳定偏好（食物、饮料、爱好、习惯等）
+- relationship：用户反复提及或重要的人际关系
+- event：近期重要事件或阶段状态，如面试、考试、搬家、项目
+- emotion_pattern：持续性情绪模式，不保存短暂情绪
+- followup：适合后续主动追问的未完成事项
+- should_store=false 表示不应写入长期记忆
+- sensitivity=high 的内容默认不要保存，除非用户明确要求记住
 - 情绪词示例：平静、开心、焦虑、难过、疲惫、烦躁、委屈、期待、放松"""
 
 _SAVE_PROFILES_TOOL = {
@@ -391,8 +634,14 @@ _SAVE_PROFILES_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "kind": {"type": "string", "enum": ["name", "preference", "experience", "feeling"]},
+                            "kind": {"type": "string", "enum": ["identity", "preference", "relationship", "event", "emotion_pattern", "followup", "name", "experience", "feeling"]},
                             "content": {"type": "string"},
+                            "source_quote": {"type": "string"},
+                            "scope": {"type": "string", "enum": ["stable", "recent", "temporary"]},
+                            "sensitivity": {"type": "string", "enum": ["low", "medium", "high"]},
+                            "confidence": {"type": "number"},
+                            "should_store": {"type": "boolean"},
+                            "expires_at": {"type": "string", "description": "可选，YYYY-MM-DD；短期事项可设置过期时间"},
                         },
                         "required": ["kind", "content"],
                     },
@@ -420,10 +669,15 @@ _REPORT_EMOTION_TOOL = {
 }
 
 _KIND_LABEL = {
+    "identity": "身份",
     "name": "姓名",
     "preference": "偏好",
+    "relationship": "关系",
     "experience": "经历",
+    "event": "事件",
     "feeling": "情绪状态",
+    "emotion_pattern": "情绪模式",
+    "followup": "待跟进",
 }
 
 
@@ -456,6 +710,7 @@ async def extract_and_save_profiles(
     }
     if s.lower() in _TRIVIAL:
         return 0, "平静", False
+    memory_signal = _should_analyze_for_memory(s)
 
     try:
         from openai import AsyncOpenAI
@@ -499,37 +754,36 @@ async def extract_and_save_profiles(
             mood = (args.get("mood") or "平静").strip()[:8]
             anxiety = bool(args.get("anxiety", False))
 
-    # 保存 profile 到 ChromaDB
-    c = _get_collection()
     saved = 0
-    if c is not None:
-        for item in profile_items:
-            kind = str(item.get("kind", "")).strip()
-            content = str(item.get("content", "")).strip()
-            if not kind or not content:
-                continue
-            doc = f"用户{_KIND_LABEL.get(kind, kind)}：{content}"
-            emb = await get_embedding(doc)
-            if not emb:
-                continue
-            pid = f"profile:{user_id}:{session_id}:{kind}:{uuid.uuid4().hex}"
-            try:
-                c.add(
-                    ids=[pid],
-                    documents=[doc],
-                    embeddings=[emb],
-                    metadatas=[{
-                        "user_id": int(user_id),
-                        "session_id": int(session_id),
-                        "role": "user",
-                        "kind": kind,
-                        "created_at": _now_iso(),
-                    }],
-                )
+    for item in profile_items:
+        if item.get("should_store") is False:
+            continue
+        kind = str(item.get("kind", "")).strip()
+        mtype = _normalize_memory_type(kind)
+        content = str(item.get("content", "")).strip()
+        if not mtype or not content:
+            continue
+        if not memory_signal and mtype not in {"identity", "followup"}:
+            continue
+        doc = f"用户{_KIND_LABEL.get(mtype, mtype)}：{content}"
+        try:
+            ok = await _save_structured_memory(
+                user_id=user_id,
+                session_id=session_id,
+                memory_type=mtype,
+                content=doc,
+                source_quote=str(item.get("source_quote") or user_message).strip(),
+                scope=str(item.get("scope") or "stable").strip(),
+                sensitivity=str(item.get("sensitivity") or "low").strip(),
+                confidence=float(item.get("confidence", 1.0)),
+                expires_at=(str(item.get("expires_at")).strip() or None) if item.get("expires_at") else None,
+                db_path=db_path,
+            )
+            if ok:
                 saved += 1
-                print(f"[Profile] 保存 {kind}: {content}")
-            except Exception as e:
-                print(f"[Profile] 存储失败: {e}")
+                print(f"[Memory] 保存 {mtype}: {content}")
+        except Exception as e:
+            print(f"[Memory] 存储失败: {e}")
 
     print(f"[AnalyzeTurn] mood={mood} anxiety={anxiety} profiles={saved}")
 

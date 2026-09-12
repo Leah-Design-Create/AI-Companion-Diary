@@ -117,6 +117,33 @@ async def init_db():
             created_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         );
+
+        -- Structured long-term memories. SQLite is the source of truth;
+        -- ChromaDB only indexes active memory content for semantic recall.
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_id INTEGER,
+            source_message_id INTEGER,
+            type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_quote TEXT,
+            scope TEXT DEFAULT 'stable',
+            sensitivity TEXT DEFAULT 'low',
+            confidence REAL DEFAULT 1.0,
+            status TEXT DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            expires_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id),
+            FOREIGN KEY (source_message_id) REFERENCES messages(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memories_user_status
+            ON memories(user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_memories_user_type
+            ON memories(user_id, type);
         """)
         await conn.commit()
         # 为旧库补充 auth 列
@@ -170,6 +197,33 @@ async def init_db():
                 await conn.commit()
             except Exception:
                 pass
+        # 为旧库补充结构化长期记忆表/列
+        await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_id INTEGER,
+            source_message_id INTEGER,
+            type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_quote TEXT,
+            scope TEXT DEFAULT 'stable',
+            sensitivity TEXT DEFAULT 'low',
+            confidence REAL DEFAULT 1.0,
+            status TEXT DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            expires_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id),
+            FOREIGN KEY (source_message_id) REFERENCES messages(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_user_status
+            ON memories(user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_memories_user_type
+            ON memories(user_id, type);
+        """)
+        await conn.commit()
     finally:
         await conn.close()
 
