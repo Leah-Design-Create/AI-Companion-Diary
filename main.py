@@ -297,6 +297,10 @@ class RenameSessionRequest(BaseModel):
     title: str = ""
 
 
+class UpdateSummaryRequest(BaseModel):
+    summary: str = ""
+
+
 # ---------- 生命周期 ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -867,6 +871,7 @@ async def api_delete_account(
         else:
             img_paths = []
         await conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
         await conn.execute("DELETE FROM user_tokens WHERE user_id = ?", (user_id,))
         await conn.execute("DELETE FROM reminders WHERE user_id = ?", (user_id,))
         await conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -1668,6 +1673,64 @@ async def api_summaries(user_id: int = Depends(get_current_user), limit: int = 2
             except Exception:
                 pass
         return out
+    finally:
+        await conn.close()
+
+
+# ---------- 更新 / 删除 单条日记总结 ----------
+@app.put("/api/summaries/{session_id}")
+async def api_update_summary(
+    session_id: int,
+    req: UpdateSummaryRequest,
+    user_id: int = Depends(get_current_user),
+):
+    """更新某条会话的日记总结（用户手动编辑）。"""
+    new_summary = (req.summary or "").strip()
+    if not new_summary:
+        raise HTTPException(status_code=400, detail="总结内容不能为空")
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT id, user_id FROM sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="无权编辑该记录")
+        await conn.execute(
+            "UPDATE sessions SET summary = ? WHERE id = ?",
+            (new_summary, session_id),
+        )
+        await conn.commit()
+        return {"ok": True, "session_id": session_id, "summary": new_summary}
+    finally:
+        await conn.close()
+
+
+@app.delete("/api/summaries/{session_id}")
+async def api_delete_summary(
+    session_id: int,
+    user_id: int = Depends(get_current_user),
+):
+    """删除某条日记总结（只清空 summary 字段，不删除会话和聊天记录）。
+    若需要彻底删除会话，使用 DELETE /api/sessions/{id}。"""
+    conn = await get_db()
+    try:
+        cursor = await conn.execute(
+            "SELECT id, user_id FROM sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="无权删除该记录")
+        await conn.execute(
+            "UPDATE sessions SET summary = NULL WHERE id = ?",
+            (session_id,),
+        )
+        await conn.commit()
+        return {"ok": True, "session_id": session_id}
     finally:
         await conn.close()
 

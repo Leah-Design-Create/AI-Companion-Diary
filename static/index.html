@@ -624,6 +624,47 @@
     .summary-card .card-mood-empty { color: var(--ink-light); }
     .summary-card .card-mood-image { margin: -24px -24px 16px; border-radius: 16px 16px 0 0; overflow: hidden; }
     .summary-card .card-mood-image img { width: 100%; height: 160px; object-fit: cover; display: block; }
+    .summary-card .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+    .summary-card .btn-card-action {
+      width: 28px; height: 28px; border: none; border-radius: 6px; background: transparent;
+      color: var(--ink-light); cursor: pointer; font-size: 14px; padding: 0; display: inline-flex;
+      align-items: center; justify-content: center; transition: background 0.15s, color 0.15s;
+    }
+    .summary-card .btn-card-action:hover { background: var(--border); color: var(--ink); }
+    .summary-card .btn-card-action.delete:hover { background: #f5d0d0; color: #c62828; }
+    .summary-card .summary-textarea {
+      width: 100%;
+      min-height: 120px;
+      padding: 12px 14px;
+      border: 1px solid var(--accent-warm);
+      border-radius: 10px;
+      background: var(--card);
+      color: var(--ink);
+      font-family: inherit;
+      font-size: 0.9rem;
+      line-height: 1.55;
+      resize: vertical;
+      outline: none;
+      box-shadow: 0 0 0 2px rgba(252, 230, 180, 0.3);
+      margin-bottom: 12px;
+    }
+    .summary-card .summary-textarea:focus { border-color: var(--accent-warm-hover); }
+    .summary-card .edit-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+    .summary-card .btn-edit-save,
+    .summary-card .btn-edit-cancel {
+      padding: 6px 16px;
+      border: none;
+      border-radius: 16px;
+      font-family: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .summary-card .btn-edit-save { background: var(--accent-warm); color: #8B7E66; }
+    .summary-card .btn-edit-save:hover { background: var(--accent-warm-hover); }
+    .summary-card .btn-edit-save:disabled { opacity: 0.5; cursor: not-allowed; }
+    .summary-card .btn-edit-cancel { background: var(--border); color: var(--ink-muted); }
+    .summary-card .btn-edit-cancel:hover { background: var(--ai-bubble); color: var(--ink); }
     .empty-state { text-align: center; padding: 60px 20px; color: var(--ink-muted); }
 
     /* ===== 情绪周报 ===== */
@@ -931,6 +972,10 @@
       .summary-card { padding: 16px; }
       .summary-card .card-mood-image img { height: 120px; }
       .summary-card .record-images img { width: 64px; height: 64px; }
+      .summary-card .btn-card-action { width: 36px; height: 36px; }
+      .summary-card .summary-textarea { font-size: 15px !important; min-height: 100px; }
+      .summary-card .btn-edit-save,
+      .summary-card .btn-edit-cancel { padding: 10px 20px; font-size: 0.88rem; }
 
       /* ── 消息间距收紧 ── */
       .msg { margin-bottom: 20px; gap: 8px; }
@@ -1955,12 +2000,14 @@
           const card = document.createElement('div');
           card.className = 'summary-card';
           const date = (s.started_at || '').slice(0, 16).replace('T', ' ');
+          const dateStr = (s.started_at || '').slice(0, 10);
           const mood = s.mood || '';
           const summary = s.summary || '';
-          const highlighted = summary.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), m => `<mark style="background:var(--accent-warm);border-radius:2px;">${m}</mark>`);
           card.dataset.sessionId = s.session_id;
-          card.dataset.date = (s.started_at || '').slice(0, 10);
-          card.innerHTML = `<div class="card-top"><div class="card-meta"><div class="icon">🔍</div><div><h3>${escapeHtml(date)}</h3></div></div></div><p>${highlighted}</p><div class="card-footer"><span class="detail-link">查看详情 →</span><span class="card-mood">${escapeHtml(mood)}</span></div>`;
+          card.dataset.date = dateStr;
+          card.dataset.summary = summary;
+          const highlighted = summary.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), m => `<mark style="background:var(--accent-warm);border-radius:2px;">${m}</mark>`);
+          card.innerHTML = `<div class="card-top"><div class="card-meta"><div class="icon">🔍</div><div><h3>${escapeHtml(date)}</h3></div></div><div class="card-actions"><button class="btn-card-action btn-edit-summary" title="编辑日记" data-action="edit">✏️</button><button class="btn-card-action delete btn-delete-summary" title="删除日记" data-action="delete">🗑️</button></div></div><p class="summary-text">${highlighted}</p><div class="card-footer"><span class="detail-link">查看详情 →</span><span class="card-mood">${escapeHtml(mood)}</span></div>`;
           list.appendChild(card);
         });
       } catch (_) {
@@ -3007,27 +3054,7 @@
         }
         if (empty) empty.style.display = 'none';
         arr.forEach(s => {
-          const card = document.createElement('div');
-          card.className = 'summary-card';
-          const startedAt = s.started_at || '';
-          const dateStr = startedAt.slice(0, 10);
-          if (dateStr) diaryDatesSet.add(dateStr);
-          const date = startedAt.slice(0, 16).replace('T', ' ');
-          let imagesHtml = '';
-          if (s.images && s.images.length > 0) {
-            imagesHtml = '<div class="record-images">' + s.images.map(path => '<img src="' + escapeHtml(API_BASE + '/api/uploads/' + path) + '" alt="对话中的图片" loading="lazy" />').join('') + '</div>';
-          }
-          card.dataset.sessionId = s.session_id;
-          card.dataset.date = dateStr;
-          const mood = s.mood || '';
-          const moodDotClass = mood && /焦虑|难过|疲惫|困惑|烦躁|委屈|低落|沮丧|生气|担心|紧张/.test(mood) ? 'negative' : (mood && /开心|期待|放松|安心|兴奋|平和|平静/.test(mood) ? 'positive' : '');
-          const moodHtml = mood
-            ? `<span class="card-mood"><span class="mood-dot ${moodDotClass}"></span>${escapeHtml(mood)}</span>`
-            : '<span class="card-mood card-mood-empty">—</span>';
-          const moodImageHtml = s.mood_image_url
-            ? `<div class="card-mood-image"><img src="${escapeHtml(s.mood_image_url)}" alt="心情画" loading="lazy" /></div>`
-            : '';
-          card.innerHTML = `${moodImageHtml}<div class="card-top"><div class="card-meta"><div class="icon">📅</div><div><h3>${escapeHtml(date)}</h3><span class="count">共 ${(s.summary || '').length > 0 ? '1' : '0'} 条记录</span></div></div></div><p>${escapeHtml(s.summary || '')}</p>${imagesHtml}${s.anxiety_detected ? '<span class="tag">本次对话有焦虑/压力相关</span>' : ''}<div class="card-footer"><span class="detail-link">查看详情 →</span>${moodHtml}</div>`;
+          const card = buildSummaryCard(s);
           list.appendChild(card);
         });
         loadMoodCalendar(calYear, calMonth + 1);
@@ -3037,13 +3064,153 @@
       }
     }
 
-    document.getElementById('summariesList').addEventListener('click', function(e) {
+    function buildSummaryCard(s) {
+      const card = document.createElement('div');
+      card.className = 'summary-card';
+      const startedAt = s.started_at || '';
+      const dateStr = startedAt.slice(0, 10);
+      if (dateStr) diaryDatesSet.add(dateStr);
+      const date = startedAt.slice(0, 16).replace('T', ' ');
+      let imagesHtml = '';
+      if (s.images && s.images.length > 0) {
+        imagesHtml = '<div class="record-images">' + s.images.map(path => '<img src="' + escapeHtml(API_BASE + '/api/uploads/' + path) + '" alt="对话中的图片" loading="lazy" />').join('') + '</div>';
+      }
+      card.dataset.sessionId = s.session_id;
+      card.dataset.date = dateStr;
+      card.dataset.summary = s.summary || '';
+      const mood = s.mood || '';
+      const moodDotClass = mood && /焦虑|难过|疲惫|困惑|烦躁|委屈|低落|沮丧|生气|担心|紧张/.test(mood) ? 'negative' : (mood && /开心|期待|放松|安心|兴奋|平和|平静/.test(mood) ? 'positive' : '');
+      const moodHtml = mood
+        ? `<span class="card-mood"><span class="mood-dot ${moodDotClass}"></span>${escapeHtml(mood)}</span>`
+        : '<span class="card-mood card-mood-empty">—</span>';
+      const moodImageHtml = s.mood_image_url
+        ? `<div class="card-mood-image"><img src="${escapeHtml(s.mood_image_url)}" alt="心情画" loading="lazy" /></div>`
+        : '';
+      card.innerHTML = `${moodImageHtml}<div class="card-top"><div class="card-meta"><div class="icon">📅</div><div><h3>${escapeHtml(date)}</h3><span class="count">共 ${(s.summary || '').length > 0 ? '1' : '0'} 条记录</span></div></div><div class="card-actions"><button class="btn-card-action btn-edit-summary" title="编辑日记" data-action="edit">✏️</button><button class="btn-card-action delete btn-delete-summary" title="删除日记" data-action="delete">🗑️</button></div></div><p class="summary-text">${escapeHtml(s.summary || '')}</p>${imagesHtml}${s.anxiety_detected ? '<span class="tag">本次对话有焦虑/压力相关</span>' : ''}<div class="card-footer"><span class="detail-link">查看详情 →</span>${moodHtml}</div>`;
+      return card;
+    }
+
+    document.getElementById('summariesList').addEventListener('click', async function(e) {
+      const editBtn = e.target.closest('.btn-edit-summary');
+      if (editBtn) {
+        e.stopPropagation();
+        const card = editBtn.closest('.summary-card');
+        if (!card || !card.dataset.sessionId) return;
+        enterEditMode(card);
+        return;
+      }
+      const deleteBtn = e.target.closest('.btn-delete-summary');
+      if (deleteBtn) {
+        e.stopPropagation();
+        const card = deleteBtn.closest('.summary-card');
+        if (!card || !card.dataset.sessionId) return;
+        if (!confirm('确定删除这条日记吗？删除后仅清空总结内容，聊天记录仍可在对应会话中查看。')) return;
+        try {
+          const sid = parseInt(card.dataset.sessionId, 10);
+          const r = await apiFetch(`/api/summaries/${sid}`, { method: 'DELETE' });
+          if (!r.ok) throw new Error();
+          showToast('已删除');
+          await loadSummaries();
+        } catch (_) {
+          showToast('删除失败，请稍后再试');
+        }
+        return;
+      }
+      const saveBtn = e.target.closest('.btn-edit-save');
+      if (saveBtn) {
+        e.stopPropagation();
+        const card = saveBtn.closest('.summary-card');
+        if (!card || !card.dataset.sessionId) return;
+        await saveEdit(card);
+        return;
+      }
+      const cancelBtn = e.target.closest('.btn-edit-cancel');
+      if (cancelBtn) {
+        e.stopPropagation();
+        const card = cancelBtn.closest('.summary-card');
+        if (!card) return;
+        exitEditMode(card, false);
+        return;
+      }
       const link = e.target.closest('.detail-link');
       if (!link) return;
       const card = e.target.closest('.summary-card');
       if (!card || !card.dataset.sessionId) return;
       openDetailModal(parseInt(card.dataset.sessionId, 10), card.dataset.date || '');
     });
+
+    function enterEditMode(card) {
+      if (card.dataset.editing === '1') return;
+      card.dataset.editing = '1';
+      const p = card.querySelector('p.summary-text');
+      if (!p) return;
+      const original = card.dataset.summary || '';
+      const ta = document.createElement('textarea');
+      ta.className = 'summary-textarea';
+      ta.value = original;
+      const actions = document.createElement('div');
+      actions.className = 'edit-actions';
+      actions.innerHTML = `<button class="btn-edit-save">保存</button><button class="btn-edit-cancel">取消</button>`;
+      p.replaceWith(ta);
+      const imgDiv = card.querySelector('.record-images');
+      if (imgDiv) {
+        imgDiv.before(actions);
+      } else {
+        const tag = card.querySelector('.tag');
+        if (tag) {
+          tag.before(actions);
+        } else {
+          const footer = card.querySelector('.card-footer');
+          if (footer) footer.before(actions);
+        }
+      }
+      ta.focus();
+      ta.style.height = Math.max(120, ta.scrollHeight) + 'px';
+      ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.max(120, ta.scrollHeight) + 'px'; });
+      ta.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { exitEditMode(card, false); }
+        if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') { saveEdit(card); }
+      });
+    }
+
+    function exitEditMode(card, saveSuccess, newText) {
+      if (card.dataset.editing !== '1') return;
+      delete card.dataset.editing;
+      const ta = card.querySelector('textarea.summary-textarea');
+      const actions = card.querySelector('.edit-actions');
+      if (!ta) return;
+      const text = saveSuccess && newText != null ? newText : (card.dataset.summary || '');
+      card.dataset.summary = text;
+      const p = document.createElement('p');
+      p.className = 'summary-text';
+      p.textContent = text;
+      ta.replaceWith(p);
+      if (actions) actions.remove();
+    }
+
+    async function saveEdit(card) {
+      const sid = parseInt(card.dataset.sessionId, 10);
+      const ta = card.querySelector('textarea.summary-textarea');
+      const saveBtn = card.querySelector('.btn-edit-save');
+      if (!ta || !sid || !saveBtn) return;
+      const content = ta.value.trim();
+      if (!content) { showToast('内容不能为空'); return; }
+      saveBtn.disabled = true;
+      try {
+        const r = await apiFetch(`/api/summaries/${sid}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ summary: content }),
+        });
+        if (!r.ok) throw new Error();
+        const d = await r.json().catch(() => ({}));
+        showToast('已保存');
+        exitEditMode(card, true, d.summary || content);
+      } catch (_) {
+        showToast('保存失败，请稍后再试');
+        saveBtn.disabled = false;
+      }
+    }
 
     async function openDetailModal(sessionId, dateStr) {
       const overlay = document.getElementById('detailModalOverlay');
